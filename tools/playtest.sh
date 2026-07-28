@@ -13,6 +13,6 @@ run() {
     --virtual-time-budget=120000 --dump-dom \
     "file://$DIR/index.html?verify=$1" 2>/dev/null | grep -o 'VERIFY:{[^<]*' | head -1
 }
-for m in solution null ablate-wind mech-parabola mech-wind mech-crater mech-dirt mech-fall mech-mirv mech-napalm mech-solver; do
+for m in solution null ablate-wind mech-parabola mech-wind mech-crater mech-dirt mech-fall mech-mirv mech-napalm mech-solver mech-determinism mech-napalm-flight mech-dirt-flight mech-shield mech-roller; do
   run "$m"
 done

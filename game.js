@@ -98,8 +98,15 @@ const WEAPONS = {
   napalm: { name: 'NAPALM', r: 12, dmg: 4, cost: 700, ammo: 2, glyph: 'N', flows: 60 },
   dirt: { name: 'DIRT BALL', r: 34, dmg: 0, cost: 300, ammo: 3, glyph: 'D', builds: true },
   tracer: { name: 'TRACER', r: 4, dmg: 0, cost: 0, ammo: Infinity, glyph: 'T' },
+  deathshead: { name: "DEATH'S HEAD", r: 34, dmg: 55, cost: 1800, ammo: 1, glyph: 'H', splits: 5 },
+  roller: { name: 'ROLLER', r: 26, dmg: 45, cost: 600, ammo: 2, glyph: 'R', rolls: true },
 };
-const WEAPON_ORDER = ['tracer', 'missile', 'bigone', 'mirv', 'napalm', 'dirt'];
+const WEAPON_ORDER = ['tracer', 'missile', 'bigone', 'mirv', 'deathshead', 'napalm', 'dirt', 'roller'];
+const GEAR = {
+  shield: { name: 'MAG SHIELD', cost: 450, desc: 'Absorbs 50 damage before your hull does' },
+  parachute: { name: 'PARACHUTE', cost: 250, desc: 'Negates one fall, then tears away' },
+  battery: { name: 'BATTERY', cost: 300, desc: 'Restores 30 hull on purchase' },
+};
 const TEAM_COL = ['#33d6ff', '#ff2e6d', '#ffd12a', '#5aff9e'];
 
 let G = null;
@@ -147,6 +154,15 @@ function carve(cx, cy, r) {
     }
   }
 }
+function scorch(cx, r) {
+  // the land remembers every burn
+  const x0 = clamp(Math.floor(cx - r * 1.2), 0, TW_ - 1), x1 = clamp(Math.ceil(cx + r * 1.2), 0, TW_ - 1);
+  for (let x = x0; x <= x1; x++) {
+    const k = 1 - Math.abs(x - cx) / (r * 1.2);
+    G.char[x] = Math.min(1, (G.char[x] || 0) + k * 0.9);
+    G.heat[x] = Math.min(1, (G.heat[x] || 0) + k);
+  }
+}
 function pile(cx, cy, r) {
   // dirt ball: mound of new earth
   const x0 = clamp(Math.floor(cx - r), 0, TW_ - 1), x1 = clamp(Math.ceil(cx + r), 0, TW_ - 1);
@@ -158,23 +174,30 @@ function pile(cx, cy, r) {
   }
 }
 function settleTanks(shooter) {
-  // gravity claims the undermined
+  // gravity claims the undermined — with a real fall, not a teleport
   for (const t of G.tanks) {
     if (t.dead) continue;
     const gy = groundY(t.x);
     if (t.y < gy - 1) {
       const fall = gy - t.y;
       t.fallFrom = t.y;
+      t.fallAnim = fall;          // render eases this down
       t.y = gy;
       if (fall > FALL_GRACE) {
-        const dmg = (fall - FALL_GRACE) * FALL_DMG;
-        damageTank(t, dmg, shooter);
-        addPop(t.x, t.y - 30, '-' + Math.round(dmg), '#ff8c42');
+        if (t.parachute > 0) {
+          t.parachute--;
+          addPop(t.x, t.y - 30, 'CHUTE!', '#5aff9e');
+          addRing(t.x, t.y - 12, '#5aff9e');
+        } else {
+          const dmg = (fall - FALL_GRACE) * FALL_DMG;
+          damageTank(t, dmg, shooter);
+          addPop(t.x, t.y - 30, '-' + Math.round(dmg), '#ff8c42');
+        }
       }
     }
   }
 }
-function damageTank(t, dmg, shooter) {
+function damageTank(t, dmg, shooter, quiet) {
   if (t.dead) return;
   if (t.shield > 0) {
     const absorbed = Math.min(t.shield, dmg);
@@ -185,19 +208,25 @@ function damageTank(t, dmg, shooter) {
     if (dmg <= 0) return;
   }
   t.hp -= dmg;
-  t.hurtT = 0.4;
-  SFX.hurt();
+  if (!quiet) { t.hurtT = 0.25; SFX.hurt(); }
+  else if (!t.hurtT) t.hurtT = 0.05;
   if (shooter !== undefined && shooter !== t.id) {
     const s = G.tanks[shooter];
-    if (s && !s.dead) { s.cash += Math.round(dmg * 4); G.stats.dmg[shooter] += Math.round(dmg); }
+    if (s && !s.dead) {
+      const pay = Math.round(dmg * 4);
+      s.cash += pay;
+      G.stats.dmg[shooter] += Math.round(dmg);
+      if (pay >= 20 && !quiet) addPop(s.x, s.y - 42, '+$' + pay, '#5aff9e');
+    }
   }
   if (t.hp <= 0) {
     t.hp = 0;
     t.dead = true;
+    t.dyingT = 0.7;
+    t.killer = shooter;
     SFX.die();
-    addBoomFX(t.x, t.y - 6, 46, '#ffffff');
-    carve(t.x, t.y - 4, 30);
-    settleTanks(shooter);
+    addBoomFX(t.x, t.y - 6, 30, '#ffd12a');
+    G.freezeT = 0.16;
     G.shake = Math.max(G.shake, 9);
   }
 }
@@ -208,14 +237,15 @@ function newGame(seed, opts) {
   const nTanks = opts.tanks || 2;
   G = {
     seed, time: 0, tick: 0, showTitle: !!opts.attract,
-    terra: genTerrain(seed),
-    tanks: [], shots: [], parts: [], pops: [], fires: [],
+    terra: genTerrain(seed), char: new Float32Array(TW_), heat: new Float32Array(TW_),
+    tanks: [], shots: [], parts: [], pops: [], fires: [], rollers: [],
     wind: 0, round: 1, maxRounds: opts.rounds || 3,
     turn: 0, phase: 'aim', phaseT: 0,     // aim -> flight -> resolve -> next
     mode: 'play', modeT: 0,
     shake: 0, hintT: 22,
     trace: [],                            // last shot's path for render
-    stats: { shots: [0, 0, 0, 0], dmg: [0, 0, 0, 0], hits: [0, 0, 0, 0], err: [[], [], [], []] },
+    stats: { shots: [0, 0, 0, 0], dmg: [0, 0, 0, 0], hits: [0, 0, 0, 0], err: [[], [], [], []], realErr: [[], [], [], []] },
+    aimTarget: [null, null, null, null],
     aiNoise: opts.aiNoise !== undefined ? opts.aiNoise : 14,
     log: [],
   };
@@ -228,7 +258,8 @@ function newGame(seed, opts) {
       angle: i % 2 === 0 ? 60 : 120,       // degrees, 0 = right, 90 = up
       power: 55, cash: 0, hurtT: 0, fallFrom: 0,
       weapon: 'missile',
-      ammo: { missile: Infinity, tracer: Infinity, bigone: 1, mirv: 1, napalm: 1, dirt: 2 },
+      ammo: { missile: Infinity, tracer: Infinity, bigone: 1, mirv: 1, napalm: 1, dirt: 2, deathshead: 0, roller: 0 },
+      parachute: 0,
       ai: opts.human === i ? null : (opts.ai ? opts.ai[i] || 'solver' : 'solver'),
       aimPlan: null,
     });
@@ -251,11 +282,12 @@ function fireShot(t, opts) {
   const a = t.angle * Math.PI / 180;
   const v = t.power * POWER_V;
   const [mx, my] = muzzle(t);
-  const w = WEAPONS[t.weapon];
-  if (w.ammo !== Infinity) {
-    if ((t.ammo[t.weapon] || 0) <= 0) return false;
-    t.ammo[t.weapon]--;
+  if (WEAPONS[t.weapon].ammo !== Infinity && (t.ammo[t.weapon] || 0) <= 0) {
+    t.weapon = 'missile';   // never a silent no-op: the workhorse answers
+    addPop(t.x, t.y - 34, 'OUT — MISSILE', '#ff8c42');
   }
+  const w = WEAPONS[t.weapon];
+  if (w.ammo !== Infinity) t.ammo[t.weapon]--;
   G.shots.push({
     x: mx, y: my, vx: Math.cos(a) * v, vy: -Math.sin(a) * v,
     weapon: t.weapon, owner: t.id, t: 0, split: false, trail: [],
@@ -263,6 +295,17 @@ function fireShot(t, opts) {
   G.stats.shots[t.id]++;
   G.trace = [];
   G.lastShotBy = t.id;
+  t.recoilT = 0.16;
+  const [mx2, my2] = muzzle(t);
+  G.parts.push({ kind: 'flash', x: mx2, y: my2, r: 22, color: '#ffffff', life: 0.12, t: 0 });
+  for (let i = 0; i < 7; i++) {
+    const sa = t.angle * Math.PI / 180 + rng(-0.4, 0.4);
+    G.parts.push({ kind: 'chip', x: mx2, y: my2, vx: Math.cos(sa) * rng(60, 160), vy: -Math.sin(sa) * rng(60, 160), color: '#ffd12a', life: rng(0.15, 0.35), t: 0 });
+  }
+  for (let i = 0; i < 5; i++) {
+    G.parts.push({ kind: 'smoke', x: t.x + rng(-8, 8), y: t.y, vx: rng(-10, 10), vy: rng(-14, -4), color: '#4a4a56', life: rng(0.5, 1.0), t: 0 });
+  }
+  G.shake = Math.max(G.shake, 2);
   if (!opts.silent) SFX.fire();
   G.phase = 'flight';
   G.phaseT = 0;
@@ -283,6 +326,9 @@ function stepShot(s, dt) {
   if (w.splits && !s.split && s.vy > 0) {
     s.split = true;
     SFX.split();
+    G.slowmoT = 0.5;
+    G.parts.push({ kind: 'flash', x: s.x, y: s.y, r: 40, color: '#ffffff', life: 0.2, t: 0 });
+    G.parts.push({ kind: 'ring', x: s.x, y: s.y, r: 4, max: 50, color: TEAM_COL[s.owner], life: 0.5, t: 0 });
     for (let i = 0; i < w.splits; i++) {
       G.shots.push({
         x: s.x, y: s.y, vx: s.vx + (i - (w.splits - 1) / 2) * 26, vy: s.vy,
@@ -304,10 +350,20 @@ function stepShot(s, dt) {
 }
 function detonate(s) {
   const w = WEAPONS[s.weapon] || { r: 20, dmg: 30 };
+  if (w.rolls && !s.rolled) {
+    // the roller lands and starts rolling downhill
+    G.rollers.push({ x: s.x, owner: s.owner, vx: 0, t: 0 });
+    SFX.dirt();
+    return;
+  }
   const wr = s.weapon === 'mirvlet' ? WEAPONS.mirv.r : w.r;
   const wd = s.weapon === 'mirvlet' ? WEAPONS.mirv.dmg : w.dmg;
   G.impactX = s.x;
   G.log.push({ shot: s.weapon, by: s.owner, x: Math.round(s.x), y: Math.round(s.y), wind: G.wind });
+  const tgt = G.aimTarget && G.aimTarget[s.owner];
+  if (tgt !== undefined && tgt !== null && s.weapon !== 'mirvlet') {
+    G.stats.realErr[s.owner].push(Math.round(Math.abs(s.x - tgt)));
+  }
   if (w.builds) {
     pile(s.x, s.y, wr);
     SFX.dirt();
@@ -319,10 +375,20 @@ function detonate(s) {
     igniteNapalm(s.x, s.y, s.owner);
     return;
   }
+  if (s.weapon === 'tracer') {
+    // a spotting puff: mark, don't maim
+    for (let i = 0; i < 6; i++) G.parts.push({ kind: 'chip', x: s.x, y: s.y, vx: rng(-40, 40), vy: rng(-60, -10), color: '#8ab0d0', life: rng(0.5, 1.0), t: 0 });
+    G.parts.push({ kind: 'ring', x: s.x, y: s.y, r: 3, max: 22, color: '#8ab0d0', life: 0.6, t: 0 });
+    blip(700, 500, 0.1, 'sine', 0.05);
+    settleTanks(s.owner);
+    return;
+  }
   carve(s.x, s.y, wr);
-  addBoomFX(s.x, s.y, wr, s.weapon === 'tracer' ? '#8ab0d0' : '#ff8c42');
+  scorch(s.x, wr);
+  addBoomFX(s.x, s.y, wr, '#ff8c42');
   (wr > 30 ? SFX.boomL : SFX.boomS)();
-  G.shake = Math.max(G.shake, wr > 30 ? 10 : 5);
+  G.shake = Math.max(G.shake, wr * 0.32);
+  if (wr > 30) G.freezeT = 0.09;
   // splash damage with falloff
   for (const t of G.tanks) {
     if (t.dead) continue;
@@ -361,19 +427,72 @@ function igniteNapalm(x, y, owner) {
 
 // ---------- turn machine ----------
 function sim(dt) {
+  if (G.freezeT > 0) { G.freezeT -= dt; return; }   // hitstop: the world holds its breath
+  if (G.slowmoT > 0) { G.slowmoT -= dt; dt *= 0.45; }
   G.time += dt; G.tick++; G.modeT += dt;
+  for (let x = 0; x < TW_; x += 1) if (G.heat[x] > 0) G.heat[x] = Math.max(0, G.heat[x] - dt * 0.25);
   G.hintT = Math.max(0, G.hintT - dt);
   if (G.shake > 0) G.shake = Math.max(0, G.shake - 20 * dt);
+  for (const t of G.tanks) {
+    if (t.hurtT > 0) t.hurtT = Math.max(0, t.hurtT - dt);
+    if (t.recoilT > 0) t.recoilT = Math.max(0, t.recoilT - dt);
+    if (t.fallAnim > 0) t.fallAnim = Math.max(0, t.fallAnim - 240 * dt);
+  }
   tickFX(dt);
   if (G.mode !== 'play') return;
   G.phaseT += dt;
 
+  // dying tanks cook off in stages
+  for (const t of G.tanks) {
+    if (t.dyingT !== undefined && t.dyingT > 0) {
+      t.dyingT -= dt;
+      if (t.dyingT < 0.45 && !t.boom2) { t.boom2 = true; addBoomFX(t.x + rng(-8, 8), t.y - 8, 22, '#ff8c42'); SFX.boomS(); }
+      if (t.dyingT <= 0) {
+        addBoomFX(t.x, t.y - 6, 46, '#ffffff');
+        carve(t.x, t.y - 4, 30);
+        scorch(t.x, 34);
+        settleTanks(t.killer);
+        SFX.boomL();
+        G.shake = Math.max(G.shake, 10);
+      }
+    }
+    // wrecks smolder
+    if (t.dead && t.dyingT <= 0 && G.tick % 14 === 0) {
+      G.parts.push({ kind: 'smoke', x: t.x + rng(-4, 4), y: t.y - 8, vx: rng(-6, 6), vy: rng(-30, -16), color: '#5a5a66', life: rng(1.2, 2.2), t: 0 });
+    }
+  }
+  // rollers roll downhill until they find a victim or a valley
+  for (const r of [...G.rollers]) {
+    r.t += dt;
+    const xi = clamp(Math.round(r.x), 2, TW_ - 3);
+    const slope = G.terra[xi + 1] - G.terra[xi - 1];   // positive = uphill to the right
+    r.vx += (-slope * 14 - r.vx * 0.8) * dt * 8;
+    r.x += r.vx * dt;
+    let boom2 = false;
+    for (const t of G.tanks) {
+      if (!t.dead && Math.abs(t.x - r.x) < 15) boom2 = true;
+    }
+    if (r.x < 4 || r.x > TW_ - 4 || Math.abs(r.vx) < 2 && r.t > 1.2) boom2 = true;
+    if (r.t > 8) boom2 = true;
+    if (boom2) {
+      G.rollers.splice(G.rollers.indexOf(r), 1);
+      detonate({ x: r.x, y: groundY(r.x) - 2, weapon: 'roller', owner: r.owner, rolled: true });
+    }
+  }
+  if (G.phase === 'flight' && G.rollers.length) { /* wait for rollers before resolving */ }
   // napalm burns
   for (const f of [...G.fires]) {
     f.ttl -= dt;
     for (const t of G.tanks) {
       if (!t.dead && Math.abs(t.x - f.x) < 14 && Math.abs(t.y - groundY(f.x)) < 16) {
-        damageTank(t, WEAPONS.napalm.dmg * dt * 10, f.owner);
+        damageTank(t, WEAPONS.napalm.dmg * dt * 10, f.owner, true);
+        t.burnAcc = (t.burnAcc || 0) + WEAPONS.napalm.dmg * dt * 10;
+        t.burnPopT = (t.burnPopT || 0) - dt;
+        if (t.burnPopT <= 0) {
+          t.burnPopT = 0.6;
+          if (t.burnAcc >= 1) { addPop(t.x, t.y - 30, '-' + Math.round(t.burnAcc) + ' BURN', '#ff8c42'); SFX.hurt(); }
+          t.burnAcc = 0;
+        }
       }
     }
     if (f.ttl <= 0) G.fires.splice(G.fires.indexOf(f), 1);
@@ -397,8 +516,8 @@ function sim(dt) {
       }
       if (!G.shots.length) break;
     }
-    if (!G.shots.length && G.fires.length === 0) { G.phase = 'resolve'; G.phaseT = 0; }
-    if (!G.shots.length && G.fires.length > 0 && G.phaseT > 5) { G.phase = 'resolve'; G.phaseT = 0; }
+    if (!G.shots.length && G.fires.length === 0 && G.rollers.length === 0) { G.phase = 'resolve'; G.phaseT = 0; }
+    if (!G.shots.length && (G.fires.length > 0 || G.rollers.length > 0) && G.phaseT > 6) { G.phase = 'resolve'; G.phaseT = 0; }
   } else if (G.phase === 'resolve') {
     if (G.phaseT > 0.6) {
       const alive = aliveTanks();
@@ -419,7 +538,6 @@ function nextTurn() {
   G.turn = n;
   G.phase = 'aim';
   G.phaseT = 0;
-  rollWind();
   const t = G.tanks[n];
   if (t) t.aimPlan = null;
   SFX.turn();
@@ -437,28 +555,45 @@ function endRound(winner) {
     SFX.cash();
   }
 }
+function aiShop(t) {
+  // canon AIs bought kit: defense first, then firepower
+  const buy = (k, cost) => { if (t.cash >= cost) { t.cash -= cost; return true; } return false; };
+  if (t.shield <= 0 && buy('shield', GEAR.shield.cost)) t.shield = 50;
+  if (t.parachute <= 0 && buy('parachute', GEAR.parachute.cost)) t.parachute = 1;
+  if (t.hp < 70 && buy('battery', GEAR.battery.cost)) t.hp = Math.min(100, t.hp + 30);
+  if ((t.ammo.bigone || 0) < 1 && buy('bigone', WEAPONS.bigone.cost)) t.ammo.bigone = (t.ammo.bigone || 0) + 1;
+  if ((t.ammo.mirv || 0) < 1 && buy('mirv', WEAPONS.mirv.cost)) t.ammo.mirv = (t.ammo.mirv || 0) + 1;
+  if ((t.ammo.roller || 0) < 1 && buy('roller', WEAPONS.roller.cost)) t.ammo.roller = (t.ammo.roller || 0) + 1;
+}
 function startNextRound() {
+  for (const t of G.tanks) if (t.ai) aiShop(t);
   G.round++;
   const cash = G.tanks.map(t => t.cash);
   const ammo = G.tanks.map(t => ({ ...t.ammo }));
+  const gear = G.tanks.map(t => ({ shield: t.shield, parachute: t.parachute, hp: Math.max(40, t.hp) }));
   const seed2 = (G.seed * 7919 + G.round * 104729) >>> 0;
   const keep = { human: G.tanks[0].ai ? undefined : 0, tanks: G.tanks.length, rounds: G.maxRounds, aiNoise: G.aiNoise, ai: G.tanks.map(t => t.ai) };
   const stats = G.stats, round = G.round, log = G.log;
   newGame(seed2, keep);
   G.round = round; G.stats = stats; G.log = log;
-  for (let i = 0; i < G.tanks.length; i++) { G.tanks[i].cash = cash[i]; G.tanks[i].ammo = ammo[i]; }
+  for (let i = 0; i < G.tanks.length; i++) {
+    const t = G.tanks[i];
+    t.cash = cash[i]; t.ammo = ammo[i];
+    t.shield = gear[i].shield; t.parachute = gear[i].parachute; t.hp = gear[i].hp;
+  }
 }
 
 // ---------- the AI: an aim solver with honest error ----------
-function simulateShot(t, angleDeg, power, wind) {
-  // ghost integration: same physics, no world mutation
+function simulateShot(t, angleDeg, power, wind, weapon) {
+  // ghost integration: same physics as the live shell, wind multiplier included
+  const wmul = (weapon === 'dirt' || weapon === 'napalm') ? 0.5 : 1;
   const a = angleDeg * Math.PI / 180;
   const v = power * POWER_V;
   let x = t.x + Math.cos(a) * 16, y = t.y - 8 - Math.sin(a) * 16;
   let vx = Math.cos(a) * v, vy = -Math.sin(a) * v;
   let steps = 0;
   while (steps++ < 3000) {
-    vx += wind * STEP;
+    vx += wind * wmul * STEP;
     vy += GRAV * STEP;
     x += vx * STEP;
     y += vy * STEP;
@@ -467,7 +602,7 @@ function simulateShot(t, angleDeg, power, wind) {
   }
   return x;
 }
-function solveAim(t, target, wind, noise) {
+function solveAim(t, target, wind, noise, weapon) {
   // canon-style solver: sample angles, binary-search power per angle, keep the best
   let best = null, bestErr = 1e9;
   const dir = target.x > t.x ? 1 : -1;
@@ -476,12 +611,12 @@ function solveAim(t, target, wind, noise) {
     let lo = 20, hi = 100;
     for (let i = 0; i < 14; i++) {
       const mid = (lo + hi) / 2;
-      const ix = simulateShot(t, ang, mid, wind);
+      const ix = simulateShot(t, ang, mid, wind, weapon);
       const over = dir > 0 ? ix > target.x : ix < target.x;
       if (over) hi = mid; else lo = mid;
     }
     const p = (lo + hi) / 2;
-    const err = Math.abs(simulateShot(t, ang, p, wind) - target.x);
+    const err = Math.abs(simulateShot(t, ang, p, wind, weapon) - target.x);
     if (err < bestErr) { bestErr = err; best = { angle: ang, power: p, err }; }
   }
   if (best && noise) {
@@ -506,13 +641,14 @@ function aiAim(t, dt) {
     const style = t.ai;
     const wind = style === 'windblind' ? 0 : G.wind;    // the ablation: pretend the air is still
     const noise = style === 'null' ? 0 : (style === 'solver' ? 0 : G.aiNoise);
+    G.aimTarget[t.id] = target.x;
     if (style === 'null') {
       // the null gunner: fixed futile mortar straight up
       t.aimPlan = { angle: 90, power: 25, wait: 0.5, weapon: 'missile' };
     } else {
       t.weapon = pickWeaponAI(t, target);
-      const sol = solveAim(t, target, wind, style === 'canon' ? G.aiNoise : noise);
-      t.aimPlan = sol ? { angle: sol.angle, power: sol.power, wait: 0.5, weapon: t.weapon, err: sol.err }
+      const sol = solveAim(t, target, wind, style === 'canon' ? G.aiNoise : noise, t.weapon);
+      t.aimPlan = sol ? { angle: sol.angle, power: sol.power, wait: 1.3, weapon: t.weapon, err: sol.err }
                       : { angle: 60, power: 60, wait: 0.5, weapon: 'missile' };
       G.stats.err[t.id].push(Math.round(sol ? sol.err : 999));
     }
@@ -554,7 +690,7 @@ function tickFX(dt) {
     if (p.t >= p.life) { G.parts.splice(i, 1); continue; }
     if (p.kind === 'chip') { p.vy += 300 * dt; p.x += p.vx * dt; p.y += p.vy * dt; if (p.y > groundY(p.x)) { p.y = groundY(p.x); p.vy *= -0.3; p.vx *= 0.7; } }
     else if (p.kind === 'smoke') { p.vy -= 20 * dt; p.x += (p.vx + G.wind * 0.4) * dt; p.y += p.vy * dt; }
-    else if (p.kind === 'ring') p.r += (p.max - p.r) * 8 * dt;
+    else if (p.kind === 'ring') p.r = Math.min(p.max, p.r + p.max * 3.2 * dt);
   }
   for (let i = G.pops.length - 1; i >= 0; i--) { const o = G.pops[i]; o.t += dt; o.y -= 26 * dt; if (o.t >= o.life) G.pops.splice(i, 1); }
 }
@@ -574,25 +710,40 @@ function draw() {
   ctx.fillRect(0, 0, W, H);
   ctx.save();
   ctx.beginPath(); ctx.rect(0, MQ, VW, VH); ctx.clip();
-  // sky
+  // sky with a job: violet depth, a dim moon, horizon breath
   const sky = ctx.createLinearGradient(0, MQ, 0, MQ + VH);
-  sky.addColorStop(0, '#0a0d1c'); sky.addColorStop(0.55, '#070810'); sky.addColorStop(1, '#04050a');
+  sky.addColorStop(0, '#0d0a20'); sky.addColorStop(0.45, '#0a0a16'); sky.addColorStop(0.8, '#0a1018'); sky.addColorStop(1, '#04050a');
   ctx.fillStyle = sky;
   ctx.fillRect(0, MQ, VW, VH);
   srand(G.seed ^ 0x51a2);
-  for (let i = 0; i < 90; i++) {
-    const sx = rng(0, VW), sy = MQ + rng(0, VH * 0.8);
-    ctx.fillStyle = `rgba(200,220,255,${rng(0.05, 0.3)})`;
-    ctx.fillRect(sx, sy, i % 7 === 0 ? 2 : 1.4, i % 7 === 0 ? 2 : 1.4);
+  for (let i = 0; i < 130; i++) {
+    const sx = rng(0, VW), sy = MQ + rng(0, VH * 0.85);
+    const big = i % 9 === 0;
+    ctx.fillStyle = `rgba(${big ? '220,230,255' : '180,200,240'},${rng(0.08, big ? 0.5 : 0.3)})`;
+    ctx.fillRect(sx, sy, big ? 2.2 : 1.4, big ? 2.2 : 1.4);
   }
-  // wind streamers
-  ctx.strokeStyle = hexA('#7fb0d0', 0.18);
-  ctx.lineWidth = 1;
-  for (let i = 0; i < 8; i++) {
-    const yy = MQ + 40 + i * 34;
-    const off = (G.time * G.wind * 2.2 + i * 160) % (VW + 120) - 60;
-    const len = clamp(Math.abs(G.wind) * 1.4, 8, 60) * Math.sign(G.wind || 1);
-    ctx.beginPath(); ctx.moveTo(off, yy); ctx.lineTo(off + len, yy); ctx.stroke();
+  // the moon watches the war
+  const moonX = VW * 0.78, moonY = MQ + 96;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  const mg2 = ctx.createRadialGradient(moonX, moonY, 0, moonX, moonY, 90);
+  mg2.addColorStop(0, 'rgba(190,200,235,0.14)'); mg2.addColorStop(0.35, 'rgba(150,160,210,0.05)'); mg2.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = mg2;
+  ctx.beginPath(); ctx.arc(moonX, moonY, 90, 0, 7); ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = 'rgba(205,215,240,0.5)';
+  ctx.beginPath(); ctx.arc(moonX, moonY, 26, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(160,170,205,0.25)';
+  ctx.beginPath(); ctx.arc(moonX - 8, moonY - 5, 5, 0, 7); ctx.arc(moonX + 7, moonY + 8, 3.5, 0, 7); ctx.fill();
+  // wind carries motes across the whole sky: the invisible made visible
+  srand(0xd1af);
+  ctx.fillStyle = hexA('#7fb0d0', 0.3);
+  for (let i = 0; i < 42; i++) {
+    const yy = MQ + rng(10, VH - 60);
+    const spd = G.wind * rng(1.6, 3.2);
+    const xx = ((rng(0, VW) + G.time * spd) % (VW + 40) + VW + 40) % (VW + 40) - 20;
+    const len = clamp(Math.abs(G.wind) * 0.5, 2, 22) * Math.sign(G.wind || 1);
+    ctx.fillRect(xx, yy, Math.max(2, Math.abs(len)) * Math.sign(len || 1), 1.4);
   }
   if (G.shake > 0) ctx.translate(rng(-1, 1) * G.shake * 0.5, rng(-1, 1) * G.shake * 0.35);
 
@@ -607,33 +758,79 @@ function draw() {
   ctx.lineTo(VW, MQ + VH);
   ctx.closePath(); ctx.fill();
 
-  // terrain: filled silhouette with glowing crust
+  // terrain: material, strata, and the memory of every burn
+  ctx.save();
   ctx.beginPath();
   ctx.moveTo(0, MQ + VH);
   for (let x = 0; x < TW_; x++) ctx.lineTo(x, MQ + VH - G.terra[x]);
   ctx.lineTo(TW_ - 1, MQ + VH);
   ctx.closePath();
-  const tg = ctx.createLinearGradient(0, MQ + VH - 320, 0, MQ + VH);
-  tg.addColorStop(0, '#1c2438'); tg.addColorStop(0.5, '#131a2a'); tg.addColorStop(1, '#0a0e18');
+  const tg = ctx.createLinearGradient(0, MQ + VH - 340, 0, MQ + VH);
+  tg.addColorStop(0, '#232c44'); tg.addColorStop(0.35, '#182034'); tg.addColorStop(0.7, '#101624'); tg.addColorStop(1, '#080c14');
   ctx.fillStyle = tg;
   ctx.fill();
-  // strata speckle
+  ctx.clip();
+  // sediment strata bands
+  for (let b = 1; b <= 4; b++) {
+    ctx.fillStyle = `rgba(0,0,12,${0.08 + b * 0.02})`;
+    ctx.fillRect(0, MQ + VH - 300 + b * 62, TW_, 5 + b * 2);
+  }
+  // speckle
   srand(G.seed ^ 0x777);
-  ctx.fillStyle = 'rgba(0,0,0,0.25)';
-  for (let i = 0; i < 260; i++) {
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  for (let i = 0; i < 320; i++) {
     const x = rng(0, TW_) | 0;
     const y = MQ + VH - rng(4, Math.max(6, G.terra[x] - 4));
     ctx.fillRect(x, y, 2, 2);
   }
-  // crust glow
+  ctx.fillStyle = 'rgba(140,170,220,0.05)';
+  for (let i = 0; i < 120; i++) {
+    const x = rng(0, TW_) | 0;
+    const y = MQ + VH - G.terra[x] + rng(2, 26);
+    ctx.fillRect(x, y, 2, 1.4);
+  }
+  // char shadows: burned columns darken below the surface
+  for (let x = 0; x < TW_; x += 2) {
+    const ch = G.char[x];
+    if (ch > 0.05) {
+      ctx.fillStyle = `rgba(8,4,2,${ch * 0.45})`;
+      ctx.fillRect(x, MQ + VH - G.terra[x], 2, 22 * ch);
+    }
+  }
+  ctx.restore();
+  // under-crust glow: the surface line breathes light downward
   ctx.save();
-  ctx.shadowColor = '#33d6ff'; ctx.shadowBlur = 7;
-  ctx.strokeStyle = hexA('#5fd4ff', 0.55);
-  ctx.lineWidth = 1.6;
+  ctx.globalCompositeOperation = 'lighter';
   ctx.beginPath();
-  ctx.moveTo(0, MQ + VH - G.terra[0]);
-  for (let x = 1; x < TW_; x += 2) ctx.lineTo(x, MQ + VH - G.terra[x]);
-  ctx.stroke();
+  ctx.moveTo(0, MQ + VH);
+  for (let x = 0; x < TW_; x++) ctx.lineTo(x, MQ + VH - G.terra[x]);
+  ctx.lineTo(TW_ - 1, MQ + VH);
+  ctx.closePath();
+  ctx.clip();
+  for (let x = 0; x < TW_; x += 4) {
+    const heat = G.heat[x];
+    ctx.fillStyle = heat > 0.03
+      ? `rgba(${255},${110 + 60 * (1 - heat)},40,${0.10 + heat * 0.2})`
+      : 'rgba(70,150,220,0.06)';
+    ctx.fillRect(x, MQ + VH - G.terra[x], 4, 8);
+  }
+  ctx.restore();
+  // crust line: cool cyan where untouched, ember-orange where fresh wounds glow
+  ctx.save();
+  ctx.lineWidth = 1.8;
+  for (let x = 0; x < TW_ - 3; x += 3) {
+    const heat = Math.max(G.heat[x], G.heat[x + 3] || 0);
+    const ch = G.char[x];
+    ctx.strokeStyle = heat > 0.03
+      ? `rgba(255,${120 + (1 - heat) * 80 | 0},50,${0.5 + heat * 0.5})`
+      : ch > 0.25 ? hexA('#8a6a55', 0.5) : hexA('#5fd4ff', 0.55);
+    ctx.shadowColor = heat > 0.03 ? '#ff8c42' : '#33d6ff';
+    ctx.shadowBlur = heat > 0.03 ? 9 : 6;
+    ctx.beginPath();
+    ctx.moveTo(x, MQ + VH - G.terra[x]);
+    ctx.lineTo(x + 3, MQ + VH - G.terra[x + 3]);
+    ctx.stroke();
+  }
   ctx.restore();
 
   // napalm pools
@@ -667,6 +864,23 @@ function draw() {
     ctx.setLineDash([]);
   }
 
+  // drag-aim guide: a short predicted arc
+  if (mouse.drag && G.turn === 0 && G.phase === 'aim' && G.mode === 'play' && !G.tanks[0].ai) {
+    const me2 = G.tanks[0];
+    const a3 = me2.angle * Math.PI / 180, v3 = me2.power * POWER_V;
+    let gx2 = me2.x + Math.cos(a3) * 16, gy2 = me2.y - 8 - Math.sin(a3) * 16;
+    let gvx = Math.cos(a3) * v3, gvy = -Math.sin(a3) * v3;
+    ctx.strokeStyle = hexA(TEAM_COL[0], 0.4);
+    ctx.setLineDash([3, 6]);
+    ctx.beginPath(); ctx.moveTo(gx2, gy2);
+    for (let i = 0; i < 26; i++) {
+      gvx += G.wind * 0.035; gvy += GRAV * 0.035;
+      gx2 += gvx * 0.035; gy2 += gvy * 0.035;
+      ctx.lineTo(gx2, gy2);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
   // tanks
   for (const t of G.tanks) drawTank(t);
 
@@ -674,18 +888,39 @@ function draw() {
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
   for (const s of G.shots) {
-    const col = TEAM_COL[s.owner] || '#ffffff';
-    for (let i = Math.max(0, s.trail.length - 60); i < s.trail.length; i += 2) {
-      const k = (i - (s.trail.length - 60)) / 60;
-      ctx.fillStyle = hexA(col, Math.max(0, k) * 0.5);
-      ctx.fillRect(s.trail[i] - 1, s.trail[i + 1] - 1, 2, 2);
+    const IDENT = {
+      bigone: { col: '#ff8c42', r: 5, glow: 20, tw: 3.5 },
+      deathshead: { col: '#ff2e6d', r: 5, glow: 20, tw: 3.5 },
+      napalm: { col: '#ffd12a', r: 4, glow: 16, tw: 2.5, gutter: true },
+      dirt: { col: '#c9a06b', r: 4.5, glow: 8, tw: 2.5 },
+      tracer: { col: '#8ab0d0', r: 2, glow: 6, tw: 1 },
+      roller: { col: '#5aff9e', r: 4, glow: 12, tw: 2.5 },
+      mirvlet: { col: TEAM_COL[s.owner] || '#fff', r: 2.5, glow: 10, tw: 1.6 },
+    };
+    const id2 = IDENT[s.weapon] || { col: TEAM_COL[s.owner] || '#ffffff', r: 3, glow: 12, tw: 2 };
+    for (let i = Math.max(0, s.trail.length - 70); i < s.trail.length; i += 2) {
+      const k = (i - (s.trail.length - 70)) / 70;
+      ctx.fillStyle = hexA(id2.col, Math.max(0, k) * 0.55);
+      const tw2 = id2.tw * Math.max(0.3, k);
+      ctx.fillRect(s.trail[i] - tw2 / 2, s.trail[i + 1] - tw2 / 2, tw2, tw2);
     }
+    const flick = id2.gutter ? 0.7 + Math.sin(G.time * 40) * 0.3 : 1;
     ctx.fillStyle = '#ffffff';
-    ctx.beginPath(); ctx.arc(s.x, s.y, 3, 0, 7); ctx.fill();
-    const gl = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, 12);
-    gl.addColorStop(0, hexA(col, 0.6)); gl.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.beginPath(); ctx.arc(s.x, s.y, id2.r * flick, 0, 7); ctx.fill();
+    const gl = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, id2.glow);
+    gl.addColorStop(0, hexA(id2.col, 0.7 * flick)); gl.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = gl;
-    ctx.beginPath(); ctx.arc(s.x, s.y, 12, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(s.x, s.y, id2.glow, 0, 7); ctx.fill();
+  }
+  // rollers glow along the ground
+  for (const r of G.rollers) {
+    const ry = groundY(r.x) - 5;
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(r.x, ry, 4, 0, 7); ctx.fill();
+    const gl2 = ctx.createRadialGradient(r.x, ry, 0, r.x, ry, 14);
+    gl2.addColorStop(0, hexA('#5aff9e', 0.7)); gl2.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = gl2;
+    ctx.beginPath(); ctx.arc(r.x, ry, 14, 0, 7); ctx.fill();
   }
   ctx.restore();
 
@@ -719,25 +954,37 @@ function draw() {
   ctx.restore();
   for (const o of G.pops) {
     const k = 1 - o.t / o.life;
-    ctx.globalAlpha = k;
-    ctx.font = `800 13px ${MONO}`;
+    const mag = /^-\d+/.test(o.txt) ? Math.min(14, Math.abs(parseInt(o.txt.slice(1))) * 0.16) : 0;
+    const popin = o.t < 0.12 ? 0.5 + (o.t / 0.12) * 0.5 : 1;
+    ctx.globalAlpha = Math.min(1, k * 1.6);
+    ctx.font = `800 ${Math.round((13 + mag) * popin)}px ${MONO}`;
     ctx.textAlign = 'center';
+    ctx.save();
+    ctx.shadowColor = o.color; ctx.shadowBlur = 6;
     ctx.fillStyle = o.color;
     ctx.fillText(o.txt, o.x, o.y);
+    ctx.restore();
     ctx.globalAlpha = 1;
   }
   ctx.restore();
 
+  if (G.hideChrome) { ctx.drawImage(VIGNETTE, 0, 0); return; }
   drawTopBar();
   drawHUD();
   if (G.mode === 'shop') drawShop();
-  if (G.mode === 'won') { dimWorld(); banner('LAST TANK GLOWING', TEAM_COL[0], endStats()); bannerButton('NEW WAR  ·  SPACE', TEAM_COL[0]); }
+  if (G.mode === 'won') {
+    if (G.tick % 30 === 0) {
+      const fx2 = rng(150, VW - 150), fy2 = MQ + rng(80, 260);
+      addBoomFX(fx2, fy2, rng(14, 26), ['#33d6ff', '#ffd12a', '#5aff9e'][G.tick % 3], true);
+    }
+    dimWorld(); banner('LAST TANK GLOWING', TEAM_COL[0], endStats()); bannerButton('NEW WAR  ·  SPACE', TEAM_COL[0]);
+  }
   if (G.mode === 'lost') { dimWorld(); banner('SCRAP METAL', TEAM_COL[1], endStats()); bannerButton('NEW WAR  ·  SPACE', TEAM_COL[1]); }
   ctx.drawImage(VIGNETTE, 0, 0);
 }
 function endStats() {
   const s = G.stats;
-  return `ROUND ${G.round}/${G.maxRounds} · SHOTS ${s.shots[0]} · HITS ${s.hits[0]} · DAMAGE DEALT ${s.dmg[0]}`;
+  return `ROUND ${G.round}/${G.maxRounds} · YOU DEALT ${s.dmg[0]} IN ${s.shots[0]} SHOTS · FOE DEALT ${s.dmg[1]} IN ${s.shots[1]}`;
 }
 function dimWorld() {
   ctx.fillStyle = 'rgba(4,5,10,0.55)';
@@ -753,9 +1000,9 @@ function drawTank(t) {
     return;
   }
   const c = TEAM_COL[t.id];
-  const flash = t.hurtT > 0;
-  if (flash) t.hurtT = Math.max(0, t.hurtT - SIMSTEP);
+  const flash = t.hurtT > 0.05;
   ctx.save();
+  if (t.fallAnim > 0) ctx.translate(0, -t.fallAnim);
   // glow pool
   ctx.globalCompositeOperation = 'lighter';
   const gp = ctx.createRadialGradient(t.x, t.y - 6, 0, t.x, t.y - 6, 34);
@@ -766,34 +1013,58 @@ function drawTank(t) {
   // shadow
   ctx.fillStyle = 'rgba(0,0,10,0.55)';
   ctx.beginPath(); ctx.ellipse(t.x, t.y + 1, 14, 3.5, 0, 0, 7); ctx.fill();
-  // barrel
+  // barrel with recoil
   const a = t.angle * Math.PI / 180;
-  ctx.strokeStyle = flash ? '#ffffff' : shade(c, 0.25);
-  ctx.lineWidth = 3.4;
+  const blen = 20 - (t.recoilT > 0 ? t.recoilT / 0.16 * 7 : 0);
+  ctx.strokeStyle = shade(c, 0.25);
+  ctx.lineWidth = 4.2;
   ctx.lineCap = 'round';
   ctx.beginPath();
-  ctx.moveTo(t.x, t.y - 9);
-  ctx.lineTo(t.x + Math.cos(a) * 17, t.y - 9 - Math.sin(a) * 17);
+  ctx.moveTo(t.x, t.y - 11);
+  ctx.lineTo(t.x + Math.cos(a) * blen, t.y - 11 - Math.sin(a) * blen);
   ctx.stroke();
+  // treads
+  ctx.fillStyle = shade(c, -0.6);
+  ctx.beginPath(); ctx.roundRect(t.x - 14, t.y - 5, 28, 6, 3); ctx.fill();
+  ctx.fillStyle = shade(c, -0.25);
+  for (let i = -10; i <= 10; i += 5) ctx.fillRect(t.x + i, t.y - 4, 2, 4);
   // hull
-  ctx.fillStyle = flash ? '#ffffff' : shade(c, -0.35);
-  ctx.strokeStyle = flash ? '#ffffff' : c;
-  ctx.lineWidth = 1.6;
-  ctx.beginPath(); ctx.roundRect(t.x - 12, t.y - 9, 24, 8, 4); ctx.fill(); ctx.stroke();
-  // dome
-  ctx.beginPath(); ctx.arc(t.x, t.y - 9, 6, Math.PI, 0); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = shade(c, -0.35);
+  ctx.strokeStyle = c;
+  ctx.lineWidth = 1.8;
+  ctx.beginPath(); ctx.roundRect(t.x - 12, t.y - 12, 24, 8, 3.5); ctx.fill(); ctx.stroke();
+  // turret dome + canopy light
+  ctx.beginPath(); ctx.arc(t.x, t.y - 12, 6.5, Math.PI, 0); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = hexA('#ffffff', 0.85);
+  ctx.fillRect(t.x - 1.5, t.y - 16.5, 3, 2);
+  // hit flash: a white overlay pulse, never a whiteout
+  if (flash) {
+    ctx.globalAlpha = 0.55 * (t.hurtT / 0.25);
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.roundRect(t.x - 13, t.y - 17, 26, 18, 4); ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+  // battle damage breathes
+  if (t.hp < 50 && G.tick % 10 === 0) {
+    G.parts.push({ kind: 'smoke', x: t.x + rng(-6, 6), y: t.y - 12, vx: rng(-6, 6), vy: rng(-26, -14), color: '#4a4a56', life: rng(0.6, 1.2), t: 0 });
+  }
+  if (t.hp < 25 && G.tick % 22 === 0) {
+    G.parts.push({ kind: 'chip', x: t.x + rng(-8, 8), y: t.y - 10, vx: rng(-30, 30), vy: rng(-60, -20), color: '#ffd12a', life: 0.3, t: 0 });
+  }
   // shield bubble
   if (t.shield > 0) {
     ctx.strokeStyle = hexA('#5aff9e', 0.4 + Math.sin(G.time * 5) * 0.15);
     ctx.lineWidth = 1.6;
     ctx.beginPath(); ctx.arc(t.x, t.y - 8, 22, 0, 7); ctx.stroke();
   }
-  // hp pips above
-  const hpw = 26;
+  // hp bar above — readable at a glance
+  const hpw = 30;
+  ctx.fillStyle = 'rgba(0,0,10,0.6)';
+  ctx.fillRect(t.x - hpw / 2 - 1, t.y - 31, hpw + 2, 7);
   ctx.fillStyle = 'rgba(255,255,255,0.13)';
-  ctx.fillRect(t.x - hpw / 2, t.y - 26, hpw, 3);
+  ctx.fillRect(t.x - hpw / 2, t.y - 30, hpw, 5);
   ctx.fillStyle = t.hp > 40 ? c : '#ff5c5c';
-  ctx.fillRect(t.x - hpw / 2, t.y - 26, hpw * (t.hp / 100), 3);
+  ctx.fillRect(t.x - hpw / 2, t.y - 30, hpw * (t.hp / 100), 5);
   // turn caret
   if (G.turn === t.id && G.phase === 'aim' && G.mode === 'play') {
     const bob = Math.sin(G.time * 5) * 3;
@@ -821,18 +1092,35 @@ function drawTopBar() {
   ctx.fillRect(0, MQ - 1.5, W, 1.5);
   ctx.font = '700 13px Verdana, sans-serif';
   ctx.letterSpacing = '2px';
-  // tanks' hp
+  // named sides with hp bars
   G.tanks.forEach((t, i) => {
-    ctx.textAlign = i === 0 ? 'left' : 'right';
-    const x = i === 0 ? 24 : W - 24 - (i - 1) * 170;
+    const left = i === 0;
+    const x = left ? 24 : W - 24 - 150;
+    ctx.textAlign = 'left';
     ctx.fillStyle = t.dead ? 'rgba(120,130,150,0.5)' : TEAM_COL[i];
-    ctx.fillText(`${i === 0 ? 'YOU' : 'FOE ' + i} ${Math.ceil(t.hp)}`, x, 24);
+    ctx.fillText(left ? 'YOU' : 'FOE', left ? x : x, 24);
+    const bx2 = left ? x + 52 : x + 52;
+    ctx.fillStyle = 'rgba(255,255,255,0.12)';
+    ctx.beginPath(); ctx.roundRect(bx2, 12, 90, 12, 5); ctx.fill();
+    ctx.fillStyle = t.dead ? 'rgba(120,130,150,0.4)' : t.hp > 40 ? TEAM_COL[i] : '#ff5c5c';
+    ctx.beginPath(); ctx.roundRect(bx2, 12, 90 * (t.hp / 100), 12, 5); ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `800 11px ${MONO}`;
+    ctx.fillText(String(Math.ceil(t.hp)), bx2 + 96, 23);
+    ctx.font = '700 13px Verdana, sans-serif';
   });
-  // wind gauge center
+  // whose turn — say it plainly
   ctx.textAlign = 'center';
+  const turnTank = G.tanks[G.turn];
+  if (G.mode === 'play' && turnTank) {
+    const yourTurn = G.turn === 0;
+    ctx.fillStyle = yourTurn ? TEAM_COL[0] : TEAM_COL[1];
+    ctx.fillText(G.phase === 'flight' ? (G.lastShotBy === 0 ? 'YOUR SHELL FLIES' : 'FOE SHELL FLIES')
+      : yourTurn ? 'YOUR TURN' : 'FOE AIMING…', W / 2 - 290, 24);
+  }
   ctx.fillStyle = 'rgba(190,215,240,0.9)';
-  ctx.fillText(`ROUND ${G.round}/${G.maxRounds}`, W / 2 - 130, 24);
-  const wx = W / 2 + 30;
+  ctx.fillText(`ROUND ${G.round}/${G.maxRounds}`, W / 2 - 118, 24);
+  const wx = W / 2 + 60;
   ctx.fillStyle = 'rgba(140,175,210,0.75)';
   ctx.font = '700 10px Verdana, sans-serif';
   ctx.fillText('WIND', wx - 58, 24);
@@ -847,7 +1135,7 @@ function drawTopBar() {
   ctx.font = `800 12px ${MONO}`;
   ctx.fillStyle = '#ffffff';
   ctx.textAlign = 'left';
-  ctx.fillText(String(Math.abs(G.wind)) + (G.wind >= 0 ? ' →' : ' ←'), wx + 106, 23);
+  ctx.fillText(`${Math.abs(G.wind)}/${WIND_MAX} ${G.wind >= 0 ? '→' : '←'}`, wx + 106, 23);
   ctx.letterSpacing = '0px';
   if (G.hintT > 0 && G.mode === 'play') {
     const HINTS = [
@@ -891,7 +1179,7 @@ function drawHUD() {
   // weapon chips
   let hovTip = null;
   WEAPON_ORDER.forEach((wk, i) => {
-    const bx = 300 + i * 96, by = HY + 12, bw = 86, bh = 66;
+    const bx = 258 + i * 88, by = HY + 12, bw = 80, bh = 66;
     const w = WEAPONS[wk];
     const n = me.ammo[wk];
     const have = n === Infinity || n > 0;
@@ -937,13 +1225,17 @@ function drawHUD() {
     ctx.fillText(String(i + 1), bx + bw - 10.5, by + 13.5);
   });
   // cash + fire button
-  label('CASH', 918, HY);
-  ctx.font = `800 20px ${MONO}`;
+  label('CASH', 984, HY);
+  ctx.font = `800 18px ${MONO}`;
   ctx.textAlign = 'left';
   ctx.fillStyle = '#ffd12a';
-  ctx.fillText('$' + me.cash, 918, HY + 58);
+  ctx.fillText('$' + me.cash, 984, HY + 56);
+  ctx.font = `700 9px ${MONO}`;
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(150,180,215,0.65)';
+  ctx.fillText('ARROWS AIM · SHIFT FINE · TAB CYCLES · SPACE FIRES · DRAG FROM TANK TO AIM', 26, H - 8);
   const myTurn = G.turn === 0 && G.phase === 'aim' && G.mode === 'play' && !me.ai && !me.dead;
-  const fbx = 1030, fby = HY + 18, fbw = 220, fbh = 62;
+  const fbx = 1074, fby = HY + 16, fbw = 182, fbh = 64;
   const fhov = mouse.x > fbx && mouse.x < fbx + fbw && mouse.y > fby && mouse.y < fby + fbh;
   ctx.save();
   if (myTurn) { ctx.shadowColor = TEAM_COL[0]; ctx.shadowBlur = fhov ? 18 : 10; }
@@ -956,7 +1248,7 @@ function drawHUD() {
   ctx.letterSpacing = '3px';
   ctx.textAlign = 'center';
   ctx.fillStyle = myTurn ? '#ffffff' : 'rgba(160,195,230,0.5)';
-  ctx.fillText(myTurn ? 'FIRE' : G.phase === 'flight' ? 'SHOT AWAY' : 'HOLD', fbx + fbw / 2, fby + 39);
+  ctx.fillText(myTurn ? 'FIRE' : G.phase === 'flight' ? (G.lastShotBy === 0 ? 'SHELL AWAY' : 'FOE SHELL') : G.turn !== 0 ? 'FOE AIMING' : 'WAIT', fbx + fbw / 2, fby + 39);
   ctx.letterSpacing = '0px';
   ctx.restore();
   // tooltip
@@ -990,44 +1282,79 @@ function drawHUD() {
 }
 function drawShop() {
   dimWorld();
-  const by = H / 2 - 150, bh = 300;
-  ctx.fillStyle = 'rgba(5,8,15,0.96)';
-  ctx.fillRect(W / 2 - 330, by, 660, bh);
+  const pw = 1080, ph = 470, px = W / 2 - pw / 2, by = H / 2 - ph / 2 - 10;
+  ctx.fillStyle = 'rgba(5,8,15,0.97)';
+  ctx.beginPath(); ctx.roundRect(px, by, pw, ph, 10); ctx.fill();
   ctx.strokeStyle = 'rgba(200,220,240,0.5)'; ctx.lineWidth = 1.5;
-  ctx.strokeRect(W / 2 - 330, by, 660, bh);
+  ctx.beginPath(); ctx.roundRect(px, by, pw, ph, 10); ctx.stroke();
   ctx.textAlign = 'center';
   ctx.font = '900 28px "Arial Black", Arial, sans-serif';
   ctx.letterSpacing = '4px';
   ctx.fillStyle = '#ffd12a';
-  ctx.fillText('THE ARMORY', W / 2, by + 44);
+  ctx.fillText('THE ARMORY', W / 2, by + 42);
   ctx.letterSpacing = '0px';
   ctx.font = '600 12px Verdana, sans-serif';
   ctx.fillStyle = 'rgba(210,232,255,0.9)';
   const me = G.tanks[0];
-  ctx.fillText(`ROUND ${G.round} SURVIVED · YOUR CASH $${me.cash} · CLICK TO BUY · SPACE FOR ROUND ${G.round + 1}`, W / 2, by + 72);
-  const buyable = WEAPON_ORDER.filter(k => WEAPONS[k].cost > 0);
-  buyable.forEach((wk, i) => {
-    const w = WEAPONS[wk];
-    const bx = W / 2 - 300 + i * 152, byy = by + 100, bw = 140, bhh = 120;
-    const afford = me.cash >= w.cost;
-    const hov = mouse.x > bx && mouse.x < bx + bw && mouse.y > byy && mouse.y < byy + bhh;
+  const paid = G.stats.dmg[0] * 4;
+  ctx.fillText(`ROUND ${G.round} SURVIVED · DAMAGE PAY $${paid} · SURVIVAL BONUS $1000`, W / 2, by + 68);
+  ctx.font = `800 18px ${MONO}`;
+  ctx.fillStyle = '#ffd12a';
+  ctx.fillText('$' + me.cash, W / 2, by + 94);
+  const card = (bx, byy, bw, bhh, glyph, name, cost, sub, have, afford, hov) => {
     ctx.fillStyle = hov && afford ? 'rgba(255,255,255,0.09)' : 'rgba(255,255,255,0.04)';
     ctx.strokeStyle = afford ? (hov ? '#ffd12a' : 'rgba(200,220,240,0.5)') : 'rgba(160,195,230,0.2)';
     ctx.lineWidth = hov && afford ? 2 : 1;
     ctx.beginPath(); ctx.roundRect(bx, byy, bw, bhh, 8); ctx.fill(); ctx.stroke();
-    ctx.font = '900 22px "Arial Black", Arial, sans-serif';
+    ctx.font = '900 20px "Arial Black", Arial, sans-serif';
     ctx.fillStyle = afford ? TEAM_COL[0] : 'rgba(160,195,230,0.4)';
-    ctx.fillText(w.glyph, bx + bw / 2, byy + 34);
-    ctx.font = '700 9px Verdana, sans-serif';
+    ctx.fillText(glyph, bx + bw / 2, byy + 30);
+    ctx.font = '700 8.5px Verdana, sans-serif';
     ctx.fillStyle = afford ? 'rgba(220,238,255,0.95)' : 'rgba(160,195,230,0.45)';
-    ctx.fillText(w.name, bx + bw / 2, byy + 54);
-    ctx.font = `800 13px ${MONO}`;
-    ctx.fillStyle = '#ffd12a';
-    ctx.fillText('$' + w.cost, bx + bw / 2, byy + 76);
-    ctx.font = `700 11px ${MONO}`;
+    ctx.fillText(name, bx + bw / 2, byy + 48);
+    ctx.font = `800 12px ${MONO}`;
+    ctx.fillStyle = afford ? '#ffd12a' : 'rgba(160,170,150,0.5)';
+    ctx.fillText('$' + cost, bx + bw / 2, byy + 68);
+    ctx.font = '600 8px Verdana, sans-serif';
+    ctx.fillStyle = 'rgba(190,215,240,0.7)';
+    ctx.fillText(sub, bx + bw / 2, byy + 86);
+    ctx.font = `700 10px ${MONO}`;
     ctx.fillStyle = 'rgba(200,225,250,0.85)';
-    ctx.fillText('HAVE ' + (me.ammo[wk] || 0), bx + bw / 2, byy + 98);
+    ctx.fillText(have, bx + bw / 2, byy + 104);
+  };
+  const buyable = WEAPON_ORDER.filter(k => WEAPONS[k].cost > 0);
+  buyable.forEach((wk, i) => {
+    const w = WEAPONS[wk];
+    const bx = px + 24 + i * 174, byy = by + 116;
+    const afford = me.cash >= w.cost;
+    const hov = mouse.x > bx && mouse.x < bx + 160 && mouse.y > byy && mouse.y < byy + 112;
+    card(bx, byy, 160, 112, w.glyph, w.name, w.cost,
+      w.builds ? 'BUILDS ' + w.r + 'PX' : w.rolls ? 'ROLLS · ' + w.dmg + ' DMG' : w.splits ? '5 WARHEADS' : w.flows ? 'FLOWS · BURNS' : w.r + 'PX · ' + w.dmg + ' DMG',
+      'HAVE ' + (me.ammo[wk] || 0), afford, hov);
   });
+  Object.keys(GEAR).forEach((gk, i) => {
+    const g = GEAR[gk];
+    const bx = px + 24 + i * 174, byy = by + 244;
+    const have = gk === 'shield' ? 'SHIELD ' + Math.round(me.shield) : gk === 'parachute' ? 'HAVE ' + me.parachute : 'HULL ' + Math.ceil(me.hp);
+    const afford = me.cash >= g.cost;
+    const hov = mouse.x > bx && mouse.x < bx + 160 && mouse.y > byy && mouse.y < byy + 112;
+    card(bx, byy, 160, 112, g.name[0], g.name, g.cost, g.desc.length > 26 ? g.desc.slice(0, 26) + '…' : g.desc, have, afford, hov);
+  });
+  // CONTINUE: a real door out
+  const cbx = px + pw - 280, cby = by + ph - 84, cbw = 250, cbh = 56;
+  const chov = mouse.x > cbx && mouse.x < cbx + cbw && mouse.y > cby && mouse.y < cby + cbh;
+  ctx.save();
+  ctx.shadowColor = TEAM_COL[0]; ctx.shadowBlur = chov ? 16 : 8;
+  ctx.fillStyle = hexA(TEAM_COL[0], chov ? 0.35 : 0.2);
+  ctx.strokeStyle = TEAM_COL[0]; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(cbx, cby, cbw, cbh, 9); ctx.fill(); ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.font = '900 16px "Arial Black", Arial, sans-serif';
+  ctx.letterSpacing = '2px';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(`ROUND ${G.round + 1}  ·  SPACE`, cbx + cbw / 2, cby + 36);
+  ctx.letterSpacing = '0px';
+  ctx.restore();
 }
 function banner(title, color, sub) {
   ctx.save();
@@ -1074,11 +1401,13 @@ function bannerButton(label2, color) {
 function drawTitle() {
   ctx.fillStyle = '#05060c';
   ctx.fillRect(0, 0, W, H);
-  // a battle plays out dimly behind the title
+  // a battle plays out dimly behind the title — world only, no chrome
   ctx.save();
-  ctx.globalAlpha = 0.5;
+  ctx.globalAlpha = 0.65;
   const keep = G.showTitle; G.showTitle = false;
+  G.hideChrome = true;
   draw();
+  G.hideChrome = false;
   G.showTitle = keep;
   ctx.restore();
   ctx.fillStyle = 'rgba(5,6,12,0.6)';
@@ -1161,7 +1490,17 @@ canvas.addEventListener('mousemove', e => {
   mouse.x = (e.clientX - r.left) * (W / r.width);
   mouse.y = (e.clientY - r.top) * (H / r.height);
   canvas.style.cursor = (mouse.y > H - HUD_H || G.mode !== 'play') ? 'pointer' : 'crosshair';
+  if (mouse.drag && G.mode === 'play' && G.turn === 0 && G.phase === 'aim') {
+    const me = G.tanks[0];
+    const dx = mouse.x - me.x, dy = (me.y - 11) - mouse.y;
+    const d = Math.hypot(dx, dy);
+    if (d > 10) {
+      me.angle = clamp(Math.atan2(dy, dx) * 180 / Math.PI, 0, 180);
+      me.power = clamp(d / 3.2, 5, 100);
+    }
+  }
 });
+canvas.addEventListener('mouseup', () => { mouse.drag = false; });
 canvas.addEventListener('mousedown', e => {
   audio();
   if (G.showTitle) { G.showTitle = false; newGame((Math.random() * 1e9) >>> 0, { human: 0, tanks: 2, rounds: 3 }); return; }
@@ -1171,30 +1510,48 @@ canvas.addEventListener('mousedown', e => {
     return;
   }
   if (G.mode === 'shop') {
-    const by = H / 2 - 150;
+    const pw = 1080, ph = 470, px = W / 2 - pw / 2, by = H / 2 - ph / 2 - 10;
     const me = G.tanks[0];
     const buyable = WEAPON_ORDER.filter(k => WEAPONS[k].cost > 0);
     buyable.forEach((wk, i) => {
-      const bx = W / 2 - 300 + i * 152, byy = by + 100;
-      if (mouse.x > bx && mouse.x < bx + 140 && mouse.y > byy && mouse.y < byy + 120) {
+      const bx = px + 24 + i * 174, byy = by + 116;
+      if (mouse.x > bx && mouse.x < bx + 160 && mouse.y > byy && mouse.y < byy + 112) {
         const w = WEAPONS[wk];
         if (me.cash >= w.cost) { me.cash -= w.cost; me.ammo[wk] = (me.ammo[wk] || 0) + 1; SFX.cash(); }
         else SFX.hurt();
       }
     });
+    Object.keys(GEAR).forEach((gk, i) => {
+      const bx = px + 24 + i * 174, byy = by + 244;
+      if (mouse.x > bx && mouse.x < bx + 160 && mouse.y > byy && mouse.y < byy + 112) {
+        const g = GEAR[gk];
+        if (me.cash >= g.cost) {
+          me.cash -= g.cost;
+          if (gk === 'shield') me.shield = Math.min(100, me.shield + 50);
+          if (gk === 'parachute') me.parachute++;
+          if (gk === 'battery') me.hp = Math.min(100, me.hp + 30);
+          SFX.cash();
+        } else SFX.hurt();
+      }
+    });
+    const cbx = px + pw - 280, cby = by + ph - 84;
+    if (mouse.x > cbx && mouse.x < cbx + 250 && mouse.y > cby && mouse.y < cby + 56 && G.modeT > 0.4) startNextRound();
     return;
   }
   const HY = H - HUD_H;
   const me = G.tanks[0];
+  if (mouse.y < HY && mouse.y > MQ && G.mode === 'play' && G.turn === 0 && G.phase === 'aim' && !me.ai) {
+    mouse.drag = true;   // drag anywhere in the sky: the vector from your tank is your aim
+  }
   if (mouse.y > HY) {
     WEAPON_ORDER.forEach((wk, i) => {
-      const bx = 300 + i * 96;
-      if (mouse.x > bx && mouse.x < bx + 86 && mouse.y > HY + 12 && mouse.y < HY + 78) {
+      const bx = 258 + i * 88;
+      if (mouse.x > bx && mouse.x < bx + 80 && mouse.y > HY + 12 && mouse.y < HY + 78) {
         if (me.ammo[wk] === Infinity || me.ammo[wk] > 0) me.weapon = wk;
       }
     });
     const myTurn = G.turn === 0 && G.phase === 'aim' && G.mode === 'play' && !me.ai && !me.dead;
-    if (myTurn && mouse.x > 1030 && mouse.x < 1250 && mouse.y > HY + 18 && mouse.y < HY + 80) fireShot(me);
+    if (myTurn && mouse.x > 1074 && mouse.x < 1256 && mouse.y > HY + 16 && mouse.y < HY + 80) fireShot(me);
   }
 });
 function humanAim(dt) {
@@ -1253,25 +1610,28 @@ function runShot(name) {
     newGame(seed, { tanks: 2, rounds: 3 });
     const t = G.tanks[0];
     t.ammo.napalm = 1; t.weapon = 'napalm';
-    const sol = solveAim(t, G.tanks[1], G.wind, 0);
+    const sol = solveAim(t, G.tanks[1], G.wind, 0, 'napalm');
     if (sol) { t.angle = sol.angle; t.power = sol.power; }
     fireShot(t, { silent: true });
     stepUntil(() => G.fires.length > 0, 60 * 15);
     stepFor(1.2);
+    if (!G.fires.length) { document.title = 'shot-FAILED'; return; }
   } else if (name === 'dirt') {
     newGame(seed, { tanks: 2, rounds: 3 });
     const t = G.tanks[0];
     t.ammo.dirt = 1; t.weapon = 'dirt';
-    const sol = solveAim(t, G.tanks[1], G.wind, 0);
+    const sol = solveAim(t, G.tanks[1], G.wind, 0, 'dirt');
     if (sol) { t.angle = sol.angle; t.power = sol.power; }
+    const dirtBefore = G.terra.reduce((a2, b2) => a2 + b2, 0);
     fireShot(t, { silent: true });
     stepUntil(() => G.phase === 'resolve', 60 * 15);
     stepFor(0.4);
+    if (G.terra.reduce((a2, b2) => a2 + b2, 0) <= dirtBefore + 200) { document.title = 'shot-FAILED'; return; }
   } else if (name === 'bigone') {
     newGame(seed, { tanks: 2, rounds: 3 });
     const t = G.tanks[0];
     t.ammo.bigone = 1; t.weapon = 'bigone';
-    const sol = solveAim(t, G.tanks[1], G.wind, 0);
+    const sol = solveAim(t, G.tanks[1], G.wind, 0, 'bigone');
     if (sol) { t.angle = sol.angle; t.power = sol.power; }
     fireShot(t, { silent: true });
     stepUntil(() => G.phase === 'resolve', 60 * 15);
@@ -1325,7 +1685,7 @@ function runVerifyInner(mode) {
       time: Math.round(simTime), rounds: G.round,
       hp: G.tanks.map(t => Math.ceil(t.hp)),
       shots: G.stats.shots.slice(0, 2), hits: G.stats.hits.slice(0, 2), dmg: G.stats.dmg.slice(0, 2),
-      solverErr: meanErr(G.stats.err[0]), foeErr: meanErr(G.stats.err[1]),
+      realMissPx: [meanErr(G.stats.realErr[0]), meanErr(G.stats.realErr[1])],   // measured at the impact, not in the plan
     };
   } else if (mode === 'mech-parabola') {
     // no wind: impact must match the closed-form range within 2%
@@ -1412,14 +1772,74 @@ function runVerifyInner(mode) {
     const meanX = xs.reduce((a2, b2) => a2 + b2, 0) / xs.length;
     outcome = xs.length >= 3 && meanX > 500 ? 'SOLVED' : 'FAILED';
     extra = { pools: xs.length, impactX: 500, meanFireX: Math.round(meanX) };
+  } else if (mode === 'mech-determinism') {
+    // same seed, same war: the log must be identical twice
+    const play = () => {
+      newGame(seed, { tanks: 2, rounds: 1, ai: ['solver', 'canon'] });
+      let st = 0;
+      while (st < 120 && G.mode === 'play') { sim(SIMSTEP); st += SIMSTEP; }
+      return JSON.stringify(G.log);
+    };
+    const a2 = play(), b2 = play();
+    outcome = a2 === b2 && a2.length > 10 ? 'SOLVED' : 'FAILED';
+    extra = { events: JSON.parse(a2).length, identical: a2 === b2 };
+  } else if (mode === 'mech-napalm-flight') {
+    // the test that would have caught the wind-multiplier bug: fly the real weapon
+    newGame(seed, { tanks: 2 });
+    const t = G.tanks[0];
+    t.ammo.napalm = 1; t.weapon = 'napalm';
+    const sol = solveAim(t, G.tanks[1], G.wind, 0, 'napalm');
+    t.angle = sol.angle; t.power = sol.power;
+    fireShot(t, { silent: true });
+    stepUntil(() => G.fires.length > 0 || G.phase === 'resolve', 60 * 20);
+    const miss = Math.abs(G.impactX - G.tanks[1].x);
+    outcome = G.fires.length > 0 && miss < 45 ? 'SOLVED' : 'FAILED';
+    extra = { missPx: Math.round(miss), pools: G.fires.length, wind: G.wind };
+  } else if (mode === 'mech-dirt-flight') {
+    newGame(seed, { tanks: 2 });
+    const t = G.tanks[0];
+    t.ammo.dirt = 1; t.weapon = 'dirt';
+    const foe = G.tanks[1];
+    const before = G.terra[Math.round(foe.x)];
+    const sol = solveAim(t, foe, G.wind, 0, 'dirt');
+    t.angle = sol.angle; t.power = sol.power;
+    fireShot(t, { silent: true });
+    stepUntil(() => G.phase === 'resolve', 60 * 20);
+    const miss = Math.abs(G.impactX - foe.x);
+    const raised = G.terra[Math.round(foe.x)] - before;
+    outcome = miss < 45 && raised > 10 ? 'SOLVED' : 'FAILED';
+    extra = { missPx: Math.round(miss), raisedPx: Math.round(raised), wind: G.wind };
+  } else if (mode === 'mech-shield') {
+    // the shop grants the shield; the shield eats the damage
+    newGame(seed, { tanks: 2 });
+    const t = G.tanks[1];
+    t.cash = 500;
+    aiShop(t);
+    const hadShield = t.shield;
+    damageTank(t, 30, 0);
+    outcome = hadShield >= 50 && t.hp >= 99 && t.shield <= hadShield - 30 ? 'SOLVED' : 'FAILED';
+    extra = { boughtShield: hadShield, hpAfter30dmg: Math.ceil(t.hp), shieldAfter: Math.round(t.shield) };
+  } else if (mode === 'mech-roller') {
+    // the roller rolls downhill to its victim
+    newGame(seed, { tanks: 2 });
+    for (let x = 0; x < TW_; x++) G.terra[x] = 160 + Math.abs(x - 900) * 0.35;   // a valley at x=900
+    const foe = G.tanks[1];
+    foe.x = 900; foe.y = groundY(900);
+    G.tanks[0].y = groundY(G.tanks[0].x);
+    const hp0 = foe.hp;
+    G.rollers.push({ x: 700, owner: 0, vx: 0, t: 0 });
+    stepUntil(() => G.rollers.length === 0, 60 * 15);
+    stepFor(0.5);
+    outcome = foe.hp < hp0 ? 'SOLVED' : 'FAILED';
+    extra = { hp0, hpAfter: Math.ceil(foe.hp) };
   } else if (mode === 'mech-solver') {
     // the solver must out-aim its own noise floor: mean error under 25px over 5 seeds
     let errs = [];
     for (let s2 = 0; s2 < 5; s2++) {
       newGame(seed + s2 * 7, { tanks: 2 });
       const t = G.tanks[0];
-      const sol = solveAim(t, G.tanks[1], G.wind, 0);
-      if (sol) errs.push(Math.round(Math.abs(simulateShot(t, sol.angle, sol.power, G.wind) - G.tanks[1].x)));
+      const sol = solveAim(t, G.tanks[1], G.wind, 0, 'missile');
+      if (sol) errs.push(Math.round(Math.abs(simulateShot(t, sol.angle, sol.power, G.wind, 'missile') - G.tanks[1].x)));
     }
     const mean = errs.length ? errs.reduce((a2, b2) => a2 + b2, 0) / errs.length : 999;
     outcome = errs.length === 5 && mean < 25 ? 'SOLVED' : 'FAILED';
