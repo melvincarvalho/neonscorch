@@ -35,7 +35,7 @@ a Scorched-Earth-fidelity judge), consensus fixes, re-score to plateau —
 with the harness turned adversarial on destructible ground: **duels as
 theorems.**
 
-`tools/playtest.sh` proves 16 claims headlessly, every build:
+`tools/playtest.sh` proves 17 claims headlessly, every build:
 
 - **the physics against closed form**: the no-wind impact matches the
   analytic parabola to 0.07%; head/calm/tail wind impacts land in strict
@@ -58,7 +58,21 @@ theorems.**
 | round | composition | game-feel | HUD | visual mean | Scorched fidelity |
 |---|---|---|---|---|---|
 | 1 | 3.4 | 3.6 | 5.5 | **4.2** | 5.5 |
-| 2 (final) | TBD | TBD | TBD | **TBD** | TBD |
+| 2 (final) | 5.0 | 6.4 | 7.0 | **6.1** | 7.0 |
+
+Final-round verdicts: game-feel — *"the land finally remembers every burn
+and deaths detonate in stages."* HUD — *"a neon artillery duel whose HUD
+finally says whose turn it is."* Fidelity — *"round 2 makes the physics,
+the wind, and the shop stop lying — real proofs fly real shells at 8px."*
+Composition — *"genuinely lovely napalm over a battlefield that still
+whispers."* A post-panel fix batch (the Death's Head made real — 9
+warheads carrying its own stats, with the new `mech-deathshead` proof the
+fidelity critic noted was "carefully absent"; the wind hint made honest;
+tooltips for the new weapons; the AI now fires the rollers it buys; lost
+shots counted against marksmanship; resolve-phase and game-over HUD
+truthfulness; gravity-curve falls with landing dust; filled fireball
+cores; per-round shop pay) was applied after the final scores; the
+numbers above are the panel's, not post-fix.
 
 ## Honest assessment
 
@@ -76,7 +90,13 @@ theorems.**
 
 ## Process notes
 
-1. **The round-1 fidelity critic caught a real ballistics bug the proofs
+1. **The round-2 fidelity critic caught a fraudulent weapon**: the
+   Death's Head's own radius and damage were dead config — every split
+   warhead silently used the MIRV's stats, making the $1800 flagship a
+   repainted $900 MIRV. The proof that would have caught it didn't
+   exist; it does now (9 warheads, more impacts, more damage, machine-
+   checked against the MIRV in the same run).
+2. **The round-1 fidelity critic caught a real ballistics bug the proofs
    had missed**: the live shell applied half wind to napalm and dirt,
    but the AI's ghost integrator applied full wind — so every AI napalm
    and dirt shot systematically missed, and two "evidence" screenshots
@@ -84,11 +104,11 @@ theorems.**
    had bypassed flight entirely, which is why they stayed green. The fix
    came with the tests that would have caught it: full-flight accuracy
    proofs for both weapons.
-2. **The wind was gaslighting its own tracer.** Wind rerolled every
+3. **The wind was gaslighting its own tracer.** Wind rerolled every
    turn, so the free spotting round taught you about air that no longer
    existed by your next shot. Canon's default — wind steady within a
    round — fixed the mechanic and the tooltip's honesty at once.
-3. **The null gunner was accidentally a weapon.** A vertical mortar at
+4. **The null gunner was accidentally a weapon.** A vertical mortar at
    power 95 drifts with the wind clear across the map; the "futile"
    control was landing hits. Futility had to be engineered down to a
    low-power lob that returns to sender.
