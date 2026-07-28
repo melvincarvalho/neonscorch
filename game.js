@@ -1234,9 +1234,9 @@ function runShot(name) {
     G.time = 1.2;
   } else if (name === 'duel') {
     newGame(seed, { tanks: 2, rounds: 3 });
-    // catch a shot mid-arc
+    // catch a shot descending into frame, trail streaming behind it
     stepUntil(() => G.shots.length > 0, 60 * 30);
-    stepUntil(() => G.shots.length > 0 && G.shots[0].vy > -30, 60 * 8);
+    stepUntil(() => G.shots.length > 0 && G.shots[0].vy > 40 && G.shots[0].y > MQ + 90, 60 * 10);
   } else if (name === 'crater') {
     newGame(seed, { tanks: 2, rounds: 3 });
     stepUntil(() => G.log.length >= 3, 60 * 90);
@@ -1248,7 +1248,7 @@ function runShot(name) {
     t.angle = 62; t.power = 82;
     fireShot(t, { silent: true });
     stepUntil(() => G.shots.length > 1, 60 * 10);   // after the split
-    stepFor(0.5);
+    stepUntil(() => G.shots.length > 1 && G.shots[0].y > MQ + 110, 60 * 10);   // fan visible in frame
   } else if (name === 'napalm') {
     newGame(seed, { tanks: 2, rounds: 3 });
     const t = G.tanks[0];
