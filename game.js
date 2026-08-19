@@ -36,7 +36,7 @@ function shade(hex, k) {
 
 // ---------- audio ----------
 let AC = null, AUDIO_ON = true;
-function audio() { if (!AC && AUDIO_ON) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AUDIO_ON = false; } } }
+function audio() { if (!AC && AUDIO_ON) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AUDIO_ON = false; } } if (AC && AC.state === 'suspended') AC.resume(); }
 function blip(f0, f1, dur, type, vol) {
   if (!AC || !AUDIO_ON) return;
   const t = AC.currentTime;
@@ -1015,10 +1015,11 @@ function draw() {
   drawHUD();
   if (G.mode === 'shop') drawShop();
   if (G.mode === 'won') {
-    dimWorld(); banner('LAST TANK GLOWING', TEAM_COL[0], endStats()); bannerButton('NEW WAR  ·  SPACE', TEAM_COL[0]);
+    dimWorld(); banner('LAST TANK GLOWING', TEAM_COL[0], endStats()); bannerButton(TOUCH ? 'NEW WAR  ·  TAP' : 'NEW WAR  ·  SPACE', TEAM_COL[0]);
   }
-  if (G.mode === 'lost') { dimWorld(); banner('SCRAP METAL', TEAM_COL[1], endStats()); bannerButton('NEW WAR  ·  SPACE', TEAM_COL[1]); }
+  if (G.mode === 'lost') { dimWorld(); banner('SCRAP METAL', TEAM_COL[1], endStats()); bannerButton(TOUCH ? 'NEW WAR  ·  TAP' : 'NEW WAR  ·  SPACE', TEAM_COL[1]); }
   ctx.drawImage(VIGNETTE, 0, 0);
+  drawRotateHint();
 }
 function endStats() {
   const s = G.stats;
@@ -1171,7 +1172,11 @@ function drawTopBar() {
   ctx.fillText(`${Math.abs(G.wind)}/${WIND_MAX} ${G.wind >= 0 ? '→' : '←'}`, wx + 106, 23);
   ctx.letterSpacing = '0px';
   if (G.hintT > 0 && G.mode === 'play') {
-    const HINTS = [
+    const HINTS = TOUCH ? [
+      'DRAG IN THE SKY TO AIM · TAP FIRE TO SHOOT · THE WIND HOLDS FOR THE ROUND',
+      'TAP A CHIP TO ARM IT · DIRT BURIES · NAPALM FLOWS DOWNHILL · MIRV SPLITS AT THE APEX',
+      'DAMAGE EARNS CASH · SPEND IT IN THE ARMORY BETWEEN ROUNDS',
+    ] : [
       'ARROWS AIM · SHIFT FOR FINE CONTROL · SPACE FIRES · THE WIND HOLDS FOR THE ROUND',
       'TAB CYCLES WEAPONS · DIRT BURIES · NAPALM FLOWS DOWNHILL · MIRV SPLITS AT THE APEX',
       'DAMAGE EARNS CASH · SPEND IT IN THE ARMORY BETWEEN ROUNDS',
@@ -1266,7 +1271,7 @@ function drawHUD() {
   ctx.font = `700 9px ${MONO}`;
   ctx.textAlign = 'left';
   ctx.fillStyle = 'rgba(150,180,215,0.65)';
-  ctx.fillText('ARROWS AIM · SHIFT FINE · TAB CYCLES · SPACE FIRES · DRAG FROM TANK TO AIM', 26, H - 8);
+  ctx.fillText(TOUCH ? 'DRAG IN THE SKY TO AIM · TAP A CHIP TO ARM · TAP FIRE TO SHOOT' : 'ARROWS AIM · SHIFT FINE · TAB CYCLES · SPACE FIRES · DRAG FROM TANK TO AIM', 26, H - 8);
   const myTurn = G.turn === 0 && G.phase === 'aim' && G.mode === 'play' && !me.ai && !me.dead;
   const fbx = 1074, fby = HY + 16, fbw = 182, fbh = 64;
   const fhov = mouse.x > fbx && mouse.x < fbx + fbw && mouse.y > fby && mouse.y < fby + fbh;
@@ -1387,7 +1392,7 @@ function drawShop() {
   ctx.font = '900 16px "Arial Black", Arial, sans-serif';
   ctx.letterSpacing = '2px';
   ctx.fillStyle = '#ffffff';
-  ctx.fillText(`ROUND ${G.round + 1}  ·  SPACE`, cbx + cbw / 2, cby + 36);
+  ctx.fillText(`ROUND ${G.round + 1}  ·  ${TOUCH ? 'TAP' : 'SPACE'}`, cbx + cbw / 2, cby + 36);
   ctx.letterSpacing = '0px';
   ctx.restore();
 }
@@ -1476,7 +1481,7 @@ function drawTitle() {
   ctx.letterSpacing = '3px';
   ctx.fillStyle = '#ffffff';
   ctx.shadowColor = '#ff8c42'; ctx.shadowBlur = 12;
-  ctx.fillText('PRESS SPACE TO OPEN FIRE', W / 2, ly + 118);
+  ctx.fillText(TOUCH ? 'TAP TO OPEN FIRE' : 'PRESS SPACE TO OPEN FIRE', W / 2, ly + 118);
   ctx.globalAlpha = 1; ctx.shadowBlur = 0;
   ctx.font = '600 13px Verdana, sans-serif';
   ctx.letterSpacing = '3px';
@@ -1486,11 +1491,34 @@ function drawTitle() {
   ctx.fillText("MISSILE · THE BIG ONE · MIRV · DEATH'S HEAD · NAPALM · DIRT · ROLLER · TRACER", W / 2, 496);
   ctx.letterSpacing = '0px';
   ctx.drawImage(VIGNETTE, 0, 0);
+  drawRotateHint();
+}
+function drawRotateHint() {
+  // a phone held upright letterboxes the war into a postage stamp: say so
+  if (!TOUCH || window.innerWidth >= window.innerHeight) return;
+  ctx.save();
+  ctx.fillStyle = 'rgba(5,8,15,0.92)';
+  ctx.fillRect(0, 0, W, 64);
+  ctx.fillStyle = 'rgba(255,209,42,0.7)';
+  ctx.fillRect(0, 62, W, 2);
+  ctx.font = '800 30px Verdana, sans-serif';
+  ctx.letterSpacing = '3px';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ffd12a';
+  ctx.fillText('ROTATE TO LANDSCAPE — IT PLAYS BETTER WIDE', W / 2, 42);
+  ctx.letterSpacing = '0px';
+  ctx.restore();
 }
 
 // ---------- input ----------
 const keys = {};
 let mouse = { x: 0, y: 0 };
+const TOUCH = matchMedia('(pointer: coarse)').matches || 'ontouchstart' in window;
+function pointerXY(e) {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) * (W / r.width);
+  mouse.y = (e.clientY - r.top) * (H / r.height);
+}
 window.addEventListener('keydown', e => {
   const k = e.key;
   keys[k] = true;
@@ -1520,10 +1548,8 @@ window.addEventListener('keydown', e => {
   }
 });
 window.addEventListener('keyup', e => { keys[e.key] = false; });
-canvas.addEventListener('mousemove', e => {
-  const r = canvas.getBoundingClientRect();
-  mouse.x = (e.clientX - r.left) * (W / r.width);
-  mouse.y = (e.clientY - r.top) * (H / r.height);
+canvas.addEventListener('pointermove', e => {
+  pointerXY(e);
   canvas.style.cursor = (mouse.y > H - HUD_H || G.mode !== 'play') ? 'pointer' : 'crosshair';
   if (mouse.drag && G.mode === 'play' && G.turn === 0 && G.phase === 'aim') {
     const me = G.tanks[0];
@@ -1535,8 +1561,12 @@ canvas.addEventListener('mousemove', e => {
     }
   }
 });
-canvas.addEventListener('mouseup', () => { mouse.drag = false; });
-canvas.addEventListener('mousedown', e => {
+canvas.addEventListener('pointerup', () => { mouse.drag = false; });
+canvas.addEventListener('pointercancel', () => { mouse.drag = false; });
+canvas.addEventListener('pointerdown', e => {
+  pointerXY(e);            // touch taps arrive with no hover first: read the spot from the event
+  e.preventDefault();
+  try { canvas.setPointerCapture(e.pointerId); } catch (err) { /* pointer already lifted */ }
   audio();
   if (G.showTitle) { G.showTitle = false; newGame((Math.random() * 1e9) >>> 0, { human: 0, tanks: 2, rounds: 3 }); return; }
   if ((G.mode === 'won' || G.mode === 'lost') && G.modeT > 0.6) {
