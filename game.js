@@ -21,6 +21,14 @@ function rand() {
   return _seed / 4294967296;
 }
 function rng(a, b) { return a + rand() * (b - a); }
+// FX-only RNG: purely cosmetic particles draw from here so the deterministic
+// gameplay stream (terrain, wind, AI noise) is never perturbed by juice.
+let _fxseed = 0x9e3779b9;
+function fxrand() {
+  _fxseed ^= _fxseed << 13; _fxseed ^= _fxseed >>> 17; _fxseed ^= _fxseed << 5;
+  return ((_fxseed >>> 0) % 1000000) / 1000000;
+}
+function fxrng(a, b) { return a + fxrand() * (b - a); }
 function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
 function hexA(hex, a) {
   const n = parseInt(hex.slice(1), 16);
@@ -108,6 +116,11 @@ const GEAR = {
   battery: { name: 'BATTERY', glyph: '+', cost: 300, desc: 'Restores 30 hull now' },
 };
 const TEAM_COL = ['#33d6ff', '#ff2e6d', '#ffd12a', '#5aff9e'];
+// per-weapon identity tints (match the trail colors) — HUD-side readability
+const WEAPON_TINT = {
+  tracer: '#8ab0d0', missile: '#ff8c42', bigone: '#ff8c42', mirv: '#5fd4ff',
+  deathshead: '#ff2e6d', napalm: '#ffd12a', dirt: '#c9a06b', roller: '#5aff9e',
+};
 
 let G = null;
 
@@ -239,6 +252,7 @@ function newGame(seed, opts) {
   G = {
     seed, time: 0, tick: 0, showTitle: !!opts.attract,
     terra: genTerrain(seed), char: new Float32Array(TW_), heat: new Float32Array(TW_), dirtMark: new Float32Array(TW_),
+    terra0: null,   // pristine heightfield copy — render-only, so strata seams stay put while craters cut through them
     tanks: [], shots: [], parts: [], pops: [], fires: [], rollers: [],
     wind: 0, round: 1, maxRounds: opts.rounds || 3,
     turn: 0, phase: 'aim', phaseT: 0,     // aim -> flight -> resolve -> next
@@ -266,6 +280,7 @@ function newGame(seed, opts) {
     });
   }
   for (const t of G.tanks) t.y = groundY(t.x);
+  G.terra0 = Float32Array.from(G.terra);
   rollWind();
 }
 function rollWind() {
@@ -305,6 +320,11 @@ function fireShot(t, opts) {
   }
   for (let i = 0; i < 5; i++) {
     G.parts.push({ kind: 'smoke', x: t.x + rng(-8, 8), y: t.y, vx: rng(-10, 10), vy: rng(-14, -4), color: '#4a4a56', life: rng(0.5, 1.0), t: 0 });
+  }
+  // muzzle sparks (cosmetic stream only)
+  for (let i = 0; i < 6; i++) {
+    const sa2 = t.angle * Math.PI / 180 + fxrng(-0.25, 0.25);
+    G.parts.push({ kind: 'spark', x: mx2, y: my2, vx: Math.cos(sa2) * fxrng(140, 300), vy: -Math.sin(sa2) * fxrng(140, 300), color: '#ffe9a8', life: fxrng(0.12, 0.3), t: 0 });
   }
   G.shake = Math.max(G.shake, 4.5);
   if (!opts.silent) SFX.fire();
@@ -436,7 +456,7 @@ function sim(dt) {
   if (G.freezeT > 0) { G.freezeT -= dt; return; }   // hitstop: the world holds its breath
   if (G.slowmoT > 0) { G.slowmoT -= dt; dt *= 0.45; }
   G.time += dt; G.tick++; G.modeT += dt;
-  for (let x = 0; x < TW_; x += 1) if (G.heat[x] > 0) G.heat[x] = Math.max(0, G.heat[x] - dt * 0.25);
+  for (let x = 0; x < TW_; x += 1) if (G.heat[x] > 0) G.heat[x] = Math.max(0, G.heat[x] - dt * (G.heat[x] > 0.35 ? 0.22 : 0.045));   // wounds cool fast, embers linger (render-only data)
   G.hintT = Math.max(0, G.hintT - dt);
   if (G.shake > 0) G.shake = Math.max(0, G.shake - 20 * dt);
   for (const t of G.tanks) {
@@ -695,6 +715,8 @@ function aiAim(t, dt) {
 
 // ---------- fx ----------
 function addBoomFX(x, y, r, color, soft) {
+  // NOTE: the rng() calls below are part of the deterministic gameplay stream —
+  // their count and order must not change. All added juice draws from fxrng().
   G.parts.push({ kind: 'flash', x, y, r: r * 1.6, color: '#ffffff', life: 0.15, t: 0 });
   if (!soft && r > 30) G.parts.push({ kind: 'flash', x, y, r: r * 4.5, color: '#ffd0a0', life: 0.3, t: 0 });
   if (!soft) G.parts.push({ kind: 'fire', x, y, r: r * 0.9, color, life: 0.35, t: 0 });
@@ -705,10 +727,38 @@ function addBoomFX(x, y, r, color, soft) {
     G.parts.push({
       kind: 'chip', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 60,
       color: soft ? '#c9a06b' : (i % 3 === 0 ? '#ffd12a' : color), life: rng(0.4, 0.9), t: 0,
+      w: fxrng(2, 3.6),
     });
   }
   if (!soft) for (let i = 0; i < 10; i++) {
     G.parts.push({ kind: 'smoke', x: x + rng(-r / 2, r / 2), y: y + rng(-6, 6), vx: rng(-15, 15), vy: rng(-40, -12), color: '#5a5a66', life: rng(0.8, 1.6), t: 0 });
+  }
+  // --- pure-cosmetic layers (fxrng only) ---
+  if (!soft) {
+    // staged fireball: hot core inside the bloom
+    G.parts.push({ kind: 'fire', x, y, r: r * 0.55, color: '#ffd12a', life: 0.5, t: 0 });
+    if (r > 30) G.parts.push({ kind: 'fire', x, y: y - r * 0.25, r: r * 1.25, color, life: 0.55, t: 0 });
+    // shockwave: a fast additive pressure ring
+    G.parts.push({ kind: 'shock', x, y, r: 4, max: r * 3.4, color, life: r > 30 ? 0.6 : 0.45, t: 0 });
+    // white-hot sparks that streak with velocity
+    const ns = r > 30 ? 20 : 12;
+    for (let i = 0; i < ns; i++) {
+      const a = fxrng(0, 6.28), s = fxrng(120, r > 30 ? 420 : 320);
+      G.parts.push({ kind: 'spark', x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 90, color: i % 4 === 0 ? '#ffffff' : '#ffe9a8', life: fxrng(0.3, 0.75), t: 0 });
+    }
+    // dust skirt hugging the ground
+    for (let i = 0; i < 12; i++) {
+      const dir = i % 2 === 0 ? 1 : -1;
+      G.parts.push({ kind: 'dust', x: x + dir * fxrng(2, r * 0.5), y: y + fxrng(-4, 4), vx: dir * fxrng(60, 190), vy: fxrng(-34, -8), color: '#8a7a68', life: fxrng(0.5, 1.15), t: 0 });
+    }
+    // the wound stays hot: a lingering ember glow at the blast site
+    G.parts.push({ kind: 'glow', x, y, r: r * 1.15, color: '#ff8c42', life: r > 30 ? 2.6 : 1.8, t: 0 });
+  } else {
+    // dirt/soft blast: a bigger tan dust bloom
+    for (let i = 0; i < 10; i++) {
+      const dir = i % 2 === 0 ? 1 : -1;
+      G.parts.push({ kind: 'dust', x: x + dir * fxrng(2, r * 0.5), y: y + fxrng(-6, 2), vx: dir * fxrng(40, 140), vy: fxrng(-46, -12), color: '#b8946a', life: fxrng(0.6, 1.3), t: 0 });
+    }
   }
 }
 function addRing(x, y, color) { G.parts.push({ kind: 'ring', x, y, r: 6, max: 40, color, life: 0.4, t: 0 }); }
@@ -719,8 +769,10 @@ function tickFX(dt) {
     p.t += dt;
     if (p.t >= p.life) { G.parts.splice(i, 1); continue; }
     if (p.kind === 'chip') { p.vy += 300 * dt; p.x += p.vx * dt; p.y += p.vy * dt; if (p.y > groundY(p.x)) { p.y = groundY(p.x); p.vy *= -0.3; p.vx *= 0.7; } }
+    else if (p.kind === 'spark') { p.vy += 460 * dt; p.x += p.vx * dt; p.y += p.vy * dt; if (p.y > groundY(p.x)) { p.y = groundY(p.x); p.vy *= -0.4; p.vx *= 0.6; } }
+    else if (p.kind === 'dust') { p.vx *= Math.max(0, 1 - 2.4 * dt); p.vy -= 14 * dt; p.x += p.vx * dt; p.y += p.vy * dt; }
     else if (p.kind === 'smoke') { p.vy -= 20 * dt; p.x += (p.vx + G.wind * 0.4) * dt; p.y += p.vy * dt; }
-    else if (p.kind === 'ring') p.r = p.max * Math.min(1, p.t / (p.life * 0.85));   // reaches full size as it dies
+    else if (p.kind === 'ring' || p.kind === 'shock') p.r = p.max * Math.min(1, p.t / (p.life * 0.85));   // reaches full size as it dies
   }
   for (let i = G.pops.length - 1; i >= 0; i--) { const o = G.pops[i]; o.t += dt; o.y -= 26 * dt; if (o.t >= o.life) G.pops.splice(i, 1); }
 }
@@ -742,29 +794,42 @@ function draw() {
   ctx.beginPath(); ctx.rect(0, MQ, VW, VH); ctx.clip();
   // sky with a job: violet depth, a dim moon, horizon breath
   const sky = ctx.createLinearGradient(0, MQ, 0, MQ + VH);
-  sky.addColorStop(0, '#0d0a20'); sky.addColorStop(0.45, '#0a0a16'); sky.addColorStop(0.8, '#0a1018'); sky.addColorStop(1, '#04050a');
+  sky.addColorStop(0, '#171238'); sky.addColorStop(0.4, '#100e26'); sky.addColorStop(0.75, '#0c1524'); sky.addColorStop(1, '#0a1c2c');
   ctx.fillStyle = sky;
   ctx.fillRect(0, MQ, VW, VH);
+  // nebula breath: two faint violet/teal clouds give the night depth
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  let neb = ctx.createRadialGradient(VW * 0.22, MQ + VH * 0.22, 0, VW * 0.22, MQ + VH * 0.22, 340);
+  neb.addColorStop(0, 'rgba(110,70,190,0.08)'); neb.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = neb; ctx.fillRect(0, MQ, VW, VH);
+  neb = ctx.createRadialGradient(VW * 0.62, MQ + VH * 0.5, 0, VW * 0.62, MQ + VH * 0.5, 420);
+  neb.addColorStop(0, 'rgba(40,140,180,0.06)'); neb.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = neb; ctx.fillRect(0, MQ, VW, VH);
+  ctx.restore();
   srand(G.seed ^ 0x51a2);
-  for (let i = 0; i < 130; i++) {
+  for (let i = 0; i < 150; i++) {
     const sx = rng(0, VW), sy = MQ + rng(0, VH * 0.85);
     const big = i % 9 === 0;
-    ctx.fillStyle = `rgba(${big ? '220,230,255' : '180,200,240'},${rng(0.08, big ? 0.5 : 0.3)})`;
-    ctx.fillRect(sx, sy, big ? 2.2 : 1.4, big ? 2.2 : 1.4);
+    const tw = 0.7 + 0.3 * Math.sin(G.time * rng(0.6, 2.4) + i * 1.7);
+    ctx.fillStyle = `rgba(${big ? '225,235,255' : '190,210,245'},${rng(0.18, big ? 0.85 : 0.55) * tw})`;
+    ctx.fillRect(sx, sy, big ? 2.6 : 1.7, big ? 2.6 : 1.7);
   }
-  // the moon watches the war
+  // the moon watches the war — lit limb toward the upper left
   const moonX = VW * 0.78, moonY = MQ + 96;
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
-  const mg2 = ctx.createRadialGradient(moonX, moonY, 0, moonX, moonY, 90);
-  mg2.addColorStop(0, 'rgba(190,200,235,0.14)'); mg2.addColorStop(0.35, 'rgba(150,160,210,0.05)'); mg2.addColorStop(1, 'rgba(0,0,0,0)');
+  const mg2 = ctx.createRadialGradient(moonX, moonY, 0, moonX, moonY, 100);
+  mg2.addColorStop(0, 'rgba(195,205,240,0.22)'); mg2.addColorStop(0.35, 'rgba(155,165,215,0.08)'); mg2.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = mg2;
-  ctx.beginPath(); ctx.arc(moonX, moonY, 90, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(moonX, moonY, 100, 0, 7); ctx.fill();
   ctx.restore();
-  ctx.fillStyle = 'rgba(205,215,240,0.5)';
+  const mgb = ctx.createRadialGradient(moonX - 9, moonY - 9, 2, moonX, moonY, 27);
+  mgb.addColorStop(0, 'rgba(235,240,255,0.85)'); mgb.addColorStop(0.55, 'rgba(200,210,240,0.55)'); mgb.addColorStop(1, 'rgba(130,140,185,0.3)');
+  ctx.fillStyle = mgb;
   ctx.beginPath(); ctx.arc(moonX, moonY, 26, 0, 7); ctx.fill();
-  ctx.fillStyle = 'rgba(160,170,205,0.25)';
-  ctx.beginPath(); ctx.arc(moonX - 8, moonY - 5, 5, 0, 7); ctx.arc(moonX + 7, moonY + 8, 3.5, 0, 7); ctx.fill();
+  ctx.fillStyle = 'rgba(140,150,190,0.35)';
+  ctx.beginPath(); ctx.arc(moonX - 8, moonY - 5, 5, 0, 7); ctx.arc(moonX + 7, moonY + 8, 3.5, 0, 7); ctx.arc(moonX + 2, moonY - 11, 2.4, 0, 7); ctx.fill();
   // wind carries motes across the whole sky: the invisible made visible
   srand(0xd1af);
   ctx.fillStyle = hexA('#7fb0d0', 0.3);
@@ -777,11 +842,28 @@ function draw() {
   }
   if (G.shake > 0) ctx.translate(rng(-1, 1) * G.shake * 0.5, rng(-1, 1) * G.shake * 0.35);
 
-  // distant ridge silhouette (parallax flavor)
-  ctx.fillStyle = 'rgba(30,40,70,0.35)';
+  // horizon glow: the sky warms where it meets the ridge
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  const hz = ctx.createLinearGradient(0, MQ + VH - 250, 0, MQ + VH);
+  hz.addColorStop(0, 'rgba(0,0,0,0)'); hz.addColorStop(0.7, 'rgba(45,120,170,0.10)'); hz.addColorStop(1, 'rgba(60,150,200,0.16)');
+  ctx.fillStyle = hz;
+  ctx.fillRect(0, MQ + VH - 250, VW, 250);
+  ctx.restore();
+
+  // distant ridges (two parallax layers)
+  srand(G.seed ^ 0x99);
+  ctx.fillStyle = 'rgba(34,42,84,0.5)';
   ctx.beginPath();
   ctx.moveTo(0, MQ + VH);
-  srand(G.seed ^ 0x99);
+  for (let x = 0; x <= VW; x += 40) {
+    ctx.lineTo(x, MQ + VH - G.terra[clamp(VW - x, 0, TW_ - 1)] * 0.35 - 100 - rng(0, 26));
+  }
+  ctx.lineTo(VW, MQ + VH);
+  ctx.closePath(); ctx.fill();
+  ctx.fillStyle = 'rgba(44,56,104,0.6)';
+  ctx.beginPath();
+  ctx.moveTo(0, MQ + VH);
   for (let x = 0; x <= VW; x += 32) {
     ctx.lineTo(x, MQ + VH - G.terra[clamp(x, 0, TW_ - 1)] * 0.55 - 60 - rng(0, 20));
   }
@@ -796,35 +878,64 @@ function draw() {
   ctx.lineTo(TW_ - 1, MQ + VH);
   ctx.closePath();
   const tg = ctx.createLinearGradient(0, MQ + VH - 340, 0, MQ + VH);
-  tg.addColorStop(0, '#232c44'); tg.addColorStop(0.35, '#182034'); tg.addColorStop(0.7, '#101624'); tg.addColorStop(1, '#080c14');
+  tg.addColorStop(0, '#40507e'); tg.addColorStop(0.35, '#2e3a5e'); tg.addColorStop(0.7, '#1e2842'); tg.addColorStop(1, '#121a2e');
   ctx.fillStyle = tg;
   ctx.fill();
   ctx.clip();
-  // sediment strata bands
-  for (let b = 1; b <= 4; b++) {
-    ctx.fillStyle = `rgba(0,0,12,${0.08 + b * 0.02})`;
-    ctx.fillRect(0, MQ + VH - 300 + b * 62, TW_, 5 + b * 2);
+  // contour strata: sediment seams laid down with the original hill —
+  // craters cut straight through them, so every wound shows its depth
+  const T0 = G.terra0 || G.terra;
+  ctx.lineWidth = 2.2;
+  for (let b = 0; b < 5; b++) {
+    const d = 16 + b * 34 + b * b * 4;
+    ctx.strokeStyle = `rgba(8,12,30,${0.4 - b * 0.05})`;
+    ctx.beginPath();
+    for (let x = 0; x < TW_; x += 4) {
+      const y = MQ + VH - T0[x] + d;
+      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.strokeStyle = `rgba(150,180,235,${0.06 - b * 0.008})`;
+    ctx.beginPath();
+    for (let x = 0; x < TW_; x += 4) {
+      const y = MQ + VH - T0[x] + d + 2.5;
+      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
   }
-  // speckle
+  // speckle: mineral grain in the rock
   srand(G.seed ^ 0x777);
-  ctx.fillStyle = 'rgba(0,0,0,0.28)';
-  for (let i = 0; i < 320; i++) {
+  ctx.fillStyle = 'rgba(4,7,18,0.5)';
+  for (let i = 0; i < 340; i++) {
     const x = rng(0, TW_) | 0;
     const y = MQ + VH - rng(4, Math.max(6, G.terra[x] - 4));
     ctx.fillRect(x, y, 2, 2);
   }
-  ctx.fillStyle = 'rgba(140,170,220,0.05)';
-  for (let i = 0; i < 120; i++) {
+  ctx.fillStyle = 'rgba(165,195,245,0.12)';
+  for (let i = 0; i < 160; i++) {
     const x = rng(0, TW_) | 0;
-    const y = MQ + VH - G.terra[x] + rng(2, 26);
-    ctx.fillRect(x, y, 2, 1.4);
+    const y = MQ + VH - G.terra[x] + rng(2, 30);
+    ctx.fillRect(x, y, 2.2, 1.6);
   }
-  // char shadows: burned columns darken below the surface
+  // surface ambient: the top of the ground catches the sky
+  for (let x = 0; x < TW_; x += 2) {
+    ctx.fillStyle = 'rgba(130,175,240,0.09)';
+    ctx.fillRect(x, MQ + VH - G.terra[x], 2, 12);
+  }
+  // dirt-ball earth keeps its tan builder's color
+  for (let x = 0; x < TW_; x += 2) {
+    const dm = G.dirtMark[x];
+    if (dm > 0.05) {
+      ctx.fillStyle = `rgba(201,160,107,${dm * 0.22})`;
+      ctx.fillRect(x, MQ + VH - G.terra[x], 2, 26 * dm + 6);
+    }
+  }
+  // char shadows: burned columns darken below the surface — the land remembers
   for (let x = 0; x < TW_; x += 2) {
     const ch = G.char[x];
     if (ch > 0.05) {
-      ctx.fillStyle = `rgba(8,4,2,${ch * 0.45})`;
-      ctx.fillRect(x, MQ + VH - G.terra[x], 2, 22 * ch);
+      ctx.fillStyle = `rgba(10,6,4,${ch * 0.75})`;
+      ctx.fillRect(x, MQ + VH - G.terra[x], 2, 34 * ch);
     }
   }
   ctx.restore();
@@ -840,23 +951,32 @@ function draw() {
   for (let x = 0; x < TW_; x += 4) {
     const heat = G.heat[x];
     ctx.fillStyle = heat > 0.03
-      ? `rgba(${255},${110 + 60 * (1 - heat)},40,${0.10 + heat * 0.2})`
-      : 'rgba(70,150,220,0.06)';
-    ctx.fillRect(x, MQ + VH - G.terra[x], 4, 8);
+      ? `rgba(${255},${110 + 60 * (1 - heat)},40,${0.14 + heat * 0.3})`
+      : 'rgba(80,160,230,0.10)';
+    ctx.fillRect(x, MQ + VH - G.terra[x], 4, heat > 0.03 ? 10 : 8);
+  }
+  // embers still alight in fresh wounds
+  for (let x = 0; x < TW_; x += 4) {
+    const heat = G.heat[x];
+    if (heat > 0.12 && ((x * 2654435761) >>> 13) % 7 < 2) {
+      const fl = 0.6 + 0.4 * Math.sin(G.time * 9 + x * 0.7);
+      ctx.fillStyle = `rgba(255,180,70,${heat * 0.55 * fl})`;
+      ctx.fillRect(x, MQ + VH - G.terra[x] + 2 + ((x * 40503) >>> 8) % 9, 2.5, 2.5);
+    }
   }
   ctx.restore();
   // crust line: cool cyan where untouched, ember-orange where fresh wounds glow
   ctx.save();
-  ctx.lineWidth = 1.8;
+  ctx.lineWidth = 2.2;
   for (let x = 0; x < TW_ - 3; x += 3) {
     const heat = Math.max(G.heat[x], G.heat[x + 3] || 0);
     const ch = G.char[x];
     const dm = G.dirtMark[x];
     ctx.strokeStyle = heat > 0.03
-      ? `rgba(255,${120 + (1 - heat) * 80 | 0},50,${0.5 + heat * 0.5})`
-      : ch > 0.25 ? hexA('#8a6a55', 0.5) : dm > 0.2 ? hexA('#c9a06b', 0.6) : hexA('#5fd4ff', 0.55);
+      ? `rgba(255,${120 + (1 - heat) * 80 | 0},50,${0.55 + heat * 0.45})`
+      : ch > 0.25 ? hexA('#96705a', 0.6) : dm > 0.2 ? hexA('#d8b078', 0.75) : hexA('#5fd4ff', 0.7);
     ctx.shadowColor = heat > 0.03 ? '#ff8c42' : '#33d6ff';
-    ctx.shadowBlur = heat > 0.03 ? 9 : 6;
+    ctx.shadowBlur = heat > 0.03 ? 12 : 8;
     ctx.beginPath();
     ctx.moveTo(x, MQ + VH - G.terra[x]);
     ctx.lineTo(x + 3, MQ + VH - G.terra[x + 3]);
@@ -870,23 +990,40 @@ function draw() {
     const fl = 0.6 + Math.sin(G.time * 11 + f.x) * 0.4;
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-    const fg = ctx.createRadialGradient(f.x, fy, 0, f.x, fy, 18);
-    fg.addColorStop(0, hexA('#ffd12a', 0.5 * fl)); fg.addColorStop(0.5, hexA('#ff8c42', 0.3 * fl)); fg.addColorStop(1, 'rgba(0,0,0,0)');
+    const fg = ctx.createRadialGradient(f.x, fy, 0, f.x, fy, 30);
+    fg.addColorStop(0, hexA('#ffd12a', 0.55 * fl)); fg.addColorStop(0.45, hexA('#ff8c42', 0.32 * fl)); fg.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = fg;
-    ctx.beginPath(); ctx.arc(f.x, fy, 18, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(f.x, fy, 30, 0, 7); ctx.fill();
+    // twin flame tongues, licking out of phase
     ctx.fillStyle = hexA('#ffd12a', fl);
     ctx.beginPath();
-    ctx.moveTo(f.x - 4, fy);
-    ctx.quadraticCurveTo(f.x - 2, fy - 8 - fl * 6, f.x, fy - 3 - fl * 3);
-    ctx.quadraticCurveTo(f.x + 2, fy - 10 - fl * 5, f.x + 4, fy);
+    ctx.moveTo(f.x - 4, fy + 1);
+    ctx.quadraticCurveTo(f.x - 2, fy - 9 - fl * 7, f.x, fy - 3 - fl * 3);
+    ctx.quadraticCurveTo(f.x + 2, fy - 11 - fl * 6, f.x + 4, fy + 1);
     ctx.closePath(); ctx.fill();
+    const fl2 = 0.6 + Math.sin(G.time * 13 + f.x * 1.7 + 2) * 0.4;
+    ctx.fillStyle = hexA('#ff8c42', fl2 * 0.8);
+    ctx.beginPath();
+    ctx.moveTo(f.x - 7, fy + 1);
+    ctx.quadraticCurveTo(f.x - 5, fy - 6 - fl2 * 5, f.x - 3, fy + 1);
+    ctx.moveTo(f.x + 3, fy + 1);
+    ctx.quadraticCurveTo(f.x + 5, fy - 7 - fl2 * 4, f.x + 7, fy + 1);
+    ctx.closePath(); ctx.fill();
+    // embers rise off the burn, drifting with the wind
+    for (let e = 0; e < 3; e++) {
+      const cyc = (G.time * (0.7 + e * 0.23) + f.x * 0.13 + e * 0.37) % 1;
+      const ex = f.x + Math.sin(G.time * 3 + e * 2.1 + f.x) * 4 + G.wind * 0.12 * cyc * 22;
+      const ey = fy - 4 - cyc * 34;
+      ctx.fillStyle = hexA(e % 2 ? '#ffd12a' : '#ff8c42', (1 - cyc) * 0.8);
+      ctx.fillRect(ex, ey, 2, 2);
+    }
     ctx.restore();
   }
 
   // last trace (faint) — the tracer's teaching line
   if (G.trace && G.trace.length > 4) {
-    ctx.strokeStyle = hexA('#8ab0d0', 0.22);
-    ctx.lineWidth = 1;
+    ctx.strokeStyle = hexA('#8ab0d0', 0.32);
+    ctx.lineWidth = 1.2;
     ctx.setLineDash([3, 5]);
     ctx.beginPath();
     ctx.moveTo(G.trace[0], G.trace[1]);
@@ -901,7 +1038,8 @@ function draw() {
     const a3 = me2.angle * Math.PI / 180, v3 = me2.power * POWER_V;
     let gx2 = me2.x + Math.cos(a3) * 16, gy2 = me2.y - 8 - Math.sin(a3) * 16;
     let gvx = Math.cos(a3) * v3, gvy = -Math.sin(a3) * v3;
-    ctx.strokeStyle = hexA(TEAM_COL[0], 0.4);
+    ctx.strokeStyle = hexA(TEAM_COL[0], 0.6);
+    ctx.lineWidth = 1.6;
     ctx.setLineDash([3, 6]);
     ctx.beginPath(); ctx.moveTo(gx2, gy2);
     for (let i = 0; i < 26; i++) {
@@ -930,19 +1068,21 @@ function draw() {
       mirvlet: { col: TEAM_COL[s.owner] || '#fff', r: 2.5, glow: 10, tw: 1.6 },
     };
     const id2 = IDENT[s.weapon] || { col: TEAM_COL[s.owner] || '#ffffff', r: 3, glow: 12, tw: 2 };
-    for (let i = Math.max(0, s.trail.length - 70); i < s.trail.length; i += 2) {
-      const k = (i - (s.trail.length - 70)) / 70;
-      ctx.fillStyle = hexA(id2.col, Math.max(0, k) * 0.55);
-      const tw2 = id2.tw * Math.max(0.3, k);
+    // trail: a ribbon of light with a hot recent tail
+    for (let i = Math.max(0, s.trail.length - 90); i < s.trail.length; i += 2) {
+      const k = (i - (s.trail.length - 90)) / 90;
+      const kk = Math.max(0, k);
+      ctx.fillStyle = hexA(id2.col, kk * kk * 0.9);
+      const tw2 = (id2.tw * 1.6 + 1) * Math.max(0.3, kk);
       ctx.fillRect(s.trail[i] - tw2 / 2, s.trail[i + 1] - tw2 / 2, tw2, tw2);
     }
     const flick = id2.gutter ? 0.7 + Math.sin(G.time * 40) * 0.3 : 1;
     ctx.fillStyle = '#ffffff';
-    ctx.beginPath(); ctx.arc(s.x, s.y, id2.r * flick, 0, 7); ctx.fill();
-    const gl = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, id2.glow);
-    gl.addColorStop(0, hexA(id2.col, 0.7 * flick)); gl.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.beginPath(); ctx.arc(s.x, s.y, (id2.r + 0.8) * flick, 0, 7); ctx.fill();
+    const gl = ctx.createRadialGradient(s.x, s.y, 0, s.x, s.y, id2.glow * 1.5);
+    gl.addColorStop(0, hexA(id2.col, 0.85 * flick)); gl.addColorStop(0.5, hexA(id2.col, 0.3 * flick)); gl.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = gl;
-    ctx.beginPath(); ctx.arc(s.x, s.y, id2.glow, 0, 7); ctx.fill();
+    ctx.beginPath(); ctx.arc(s.x, s.y, id2.glow * 1.5, 0, 7); ctx.fill();
   }
   // rollers glow along the ground
   for (const r of G.rollers) {
@@ -961,9 +1101,50 @@ function draw() {
   for (const p of G.parts) {
     const k = 1 - p.t / p.life;
     if (p.kind === 'chip') {
+      // debris streaks with velocity, not static squares
       ctx.globalAlpha = k;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = p.w || 3;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - (p.vx || 0) * 0.028, p.y - (p.vy || 0) * 0.028);
+      ctx.stroke();
+    } else if (p.kind === 'spark') {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = k;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 1.7;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x - p.vx * 0.05, p.y - p.vy * 0.05);
+      ctx.stroke();
+      ctx.globalCompositeOperation = 'source-over';
+    } else if (p.kind === 'dust') {
+      ctx.globalAlpha = k * 0.34;
       ctx.fillStyle = p.color;
-      ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+      ctx.beginPath(); ctx.arc(p.x, p.y, 3.5 + (1 - k) * 10, 0, 7); ctx.fill();
+    } else if (p.kind === 'glow') {
+      ctx.globalCompositeOperation = 'lighter';
+      const gk = k * k;
+      const gg = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.r);
+      gg.addColorStop(0, hexA(p.color, gk * 0.5));
+      gg.addColorStop(0.5, hexA(p.color, gk * 0.2));
+      gg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = gg;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    } else if (p.kind === 'shock') {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = k * 0.85;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = 5.5 * k + 0.8;
+      ctx.save();
+      ctx.shadowColor = p.color; ctx.shadowBlur = 16 * k;
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.stroke();
+      ctx.restore();
+      ctx.globalCompositeOperation = 'source-over';
     } else if (p.kind === 'smoke') {
       ctx.globalAlpha = k * 0.35;
       ctx.fillStyle = p.color;
@@ -1044,10 +1225,10 @@ function drawTank(t) {
   if (t.fallAnim > 0) ctx.translate(0, -t.fallAnim);
   // glow pool
   ctx.globalCompositeOperation = 'lighter';
-  const gp = ctx.createRadialGradient(t.x, t.y - 6, 0, t.x, t.y - 6, 34);
-  gp.addColorStop(0, hexA(c, 0.16)); gp.addColorStop(1, 'rgba(0,0,0,0)');
+  const gp = ctx.createRadialGradient(t.x, t.y - 6, 0, t.x, t.y - 6, 42);
+  gp.addColorStop(0, hexA(c, 0.3)); gp.addColorStop(0.55, hexA(c, 0.1)); gp.addColorStop(1, 'rgba(0,0,0,0)');
   ctx.fillStyle = gp;
-  ctx.beginPath(); ctx.arc(t.x, t.y - 6, 34, 0, 7); ctx.fill();
+  ctx.beginPath(); ctx.arc(t.x, t.y - 6, 42, 0, 7); ctx.fill();
   ctx.globalCompositeOperation = 'source-over';
   // shadow
   ctx.fillStyle = 'rgba(0,0,10,0.55)';
@@ -1074,7 +1255,11 @@ function drawTank(t) {
   ctx.beginPath(); ctx.roundRect(t.x - 12, t.y - 12, 24, 8, 3.5); ctx.fill(); ctx.stroke();
   // turret dome + canopy light
   ctx.beginPath(); ctx.arc(t.x, t.y - 12, 6.5, Math.PI, 0); ctx.fill(); ctx.stroke();
-  ctx.fillStyle = hexA('#ffffff', 0.85);
+  // rim light: the moon catches the hull top
+  ctx.strokeStyle = 'rgba(240,248,255,0.5)';
+  ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(t.x - 9, t.y - 12.6); ctx.lineTo(t.x + 9, t.y - 12.6); ctx.stroke();
+  ctx.fillStyle = hexA('#ffffff', 0.9);
   ctx.fillRect(t.x - 1.5, t.y - 16.5, 3, 2);
   // hit flash: a white overlay pulse, never a whiteout
   if (flash) {
@@ -1101,10 +1286,14 @@ function drawTank(t) {
   // turn caret
   if (G.turn === t.id && G.phase === 'aim' && G.mode === 'play') {
     const bob = Math.sin(G.time * 5) * 3;
+    ctx.save();
+    ctx.shadowColor = c; ctx.shadowBlur = 8;
     ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = c; ctx.lineWidth = 1.4;
     ctx.beginPath();
-    ctx.moveTo(t.x, t.y - 36 + bob); ctx.lineTo(t.x - 5, t.y - 43 + bob); ctx.lineTo(t.x + 5, t.y - 43 + bob);
-    ctx.closePath(); ctx.fill();
+    ctx.moveTo(t.x, t.y - 36 + bob); ctx.lineTo(t.x - 5.5, t.y - 44 + bob); ctx.lineTo(t.x + 5.5, t.y - 44 + bob);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
   }
   ctx.restore();
 }
@@ -1147,10 +1336,14 @@ function drawTopBar() {
   const turnTank = G.tanks[G.turn];
   if (G.mode === 'play' && turnTank) {
     const yourTurn = G.turn === 0;
+    ctx.save();
+    ctx.shadowColor = yourTurn ? TEAM_COL[0] : TEAM_COL[1];
+    ctx.shadowBlur = 8;
     ctx.fillStyle = yourTurn ? TEAM_COL[0] : TEAM_COL[1];
     ctx.fillText(G.phase === 'flight' ? (G.lastShotBy === 0 ? 'YOUR SHELL FLIES' : 'FOE SHELL FLIES')
       : G.phase === 'resolve' ? 'RESOLVING…'
       : yourTurn && G.phase === 'aim' ? 'YOUR TURN' : 'FOE AIMING…', W / 2 - 290, 24);
+    ctx.restore();
   }
   ctx.fillStyle = 'rgba(190,215,240,0.9)';
   ctx.fillText(`ROUND ${G.round}/${G.maxRounds}`, W / 2 - 118, 24);
@@ -1158,18 +1351,27 @@ function drawTopBar() {
   ctx.fillStyle = 'rgba(140,175,210,0.75)';
   ctx.font = '700 10px Verdana, sans-serif';
   ctx.fillText('WIND', wx - 58, 24);
-  ctx.fillStyle = 'rgba(255,255,255,0.1)';
-  ctx.fillRect(wx - 40, 12, 140, 12);
-  ctx.fillStyle = 'rgba(240,250,255,0.5)';
-  ctx.fillRect(wx + 30 - 0.75, 10, 1.5, 16);
   const wk = clamp(G.wind / WIND_MAX, -1, 1);
-  ctx.fillStyle = Math.abs(G.wind) > 25 ? '#ff8c42' : '#5fd4ff';
-  if (wk >= 0) ctx.fillRect(wx + 30, 13, 68 * wk, 10);
-  else ctx.fillRect(wx + 30 + 68 * wk, 13, -68 * wk, 10);
+  const windCol = Math.abs(G.wind) > 25 ? '#ff8c42' : '#5fd4ff';
+  ctx.fillStyle = 'rgba(255,255,255,0.1)';
+  ctx.strokeStyle = 'rgba(180,210,240,0.35)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.roundRect(wx - 40, 12, 140, 12, 6); ctx.fill(); ctx.stroke();
+  ctx.save();
+  ctx.shadowColor = windCol; ctx.shadowBlur = 6;
+  ctx.fillStyle = windCol;
+  if (wk >= 0) { ctx.beginPath(); ctx.roundRect(wx + 30, 13.5, Math.max(2, 68 * wk), 9, 4); ctx.fill(); }
+  else { ctx.beginPath(); ctx.roundRect(wx + 30 + 68 * wk, 13.5, Math.max(2, -68 * wk), 9, 4); ctx.fill(); }
+  ctx.restore();
+  // center notch on top of the fill
+  ctx.fillStyle = 'rgba(240,250,255,0.85)';
+  ctx.fillRect(wx + 30 - 0.75, 9, 1.5, 18);
   ctx.font = `800 12px ${MONO}`;
   ctx.fillStyle = '#ffffff';
   ctx.textAlign = 'left';
-  ctx.fillText(`${Math.abs(G.wind)}/${WIND_MAX} ${G.wind >= 0 ? '→' : '←'}`, wx + 106, 23);
+  const chev = G.wind === 0 ? '·' : G.wind >= 0 ? (Math.abs(G.wind) > 25 ? '»»' : '»') : (Math.abs(G.wind) > 25 ? '««' : '«');
+  ctx.fillText(`${Math.abs(G.wind)}/${WIND_MAX} `, wx + 106, 23);
+  ctx.fillStyle = windCol;
+  ctx.fillText(chev, wx + 162, 23);
   ctx.letterSpacing = '0px';
   if (G.hintT > 0 && G.mode === 'play') {
     const HINTS = TOUCH ? [
@@ -1205,6 +1407,8 @@ function drawHUD() {
   ctx.fillStyle = '#ffffff';
   ctx.fillText(String(Math.round(me.angle)) + '°', 26, HY + 62);
   label('POWER', 150, HY);
+  ctx.font = `800 26px ${MONO}`;   // label() shrank the font — restore the readout size
+  ctx.textAlign = 'left';
   ctx.fillStyle = '#ffffff';
   ctx.fillText(String(Math.round(me.power)), 150, HY + 62);
   // power bar
@@ -1244,7 +1448,7 @@ function drawHUD() {
     }
     ctx.font = '900 15px "Arial Black", Arial, sans-serif';
     ctx.textAlign = 'center';
-    ctx.fillStyle = have ? TEAM_COL[0] : 'rgba(160,195,230,0.35)';
+    ctx.fillStyle = have ? (WEAPON_TINT[wk] || TEAM_COL[0]) : 'rgba(160,195,230,0.35)';
     ctx.fillText(w.glyph, bx + bw / 2, by + 26);
     ctx.font = '700 7.5px Verdana, sans-serif';
     ctx.letterSpacing = '0.5px';
@@ -1341,13 +1545,13 @@ function drawShop() {
   ctx.font = `800 18px ${MONO}`;
   ctx.fillStyle = '#ffd12a';
   ctx.fillText('$' + me.cash, W / 2, by + 94);
-  const card = (bx, byy, bw, bhh, glyph, name, cost, sub, have, afford, hov) => {
+  const card = (bx, byy, bw, bhh, glyph, name, cost, sub, have, afford, hov, tint) => {
     ctx.fillStyle = hov && afford ? 'rgba(255,255,255,0.09)' : 'rgba(255,255,255,0.04)';
     ctx.strokeStyle = afford ? (hov ? '#ffd12a' : 'rgba(200,220,240,0.5)') : 'rgba(160,195,230,0.2)';
     ctx.lineWidth = hov && afford ? 2 : 1;
     ctx.beginPath(); ctx.roundRect(bx, byy, bw, bhh, 8); ctx.fill(); ctx.stroke();
     ctx.font = '900 20px "Arial Black", Arial, sans-serif';
-    ctx.fillStyle = afford ? TEAM_COL[0] : 'rgba(160,195,230,0.4)';
+    ctx.fillStyle = afford ? (tint || TEAM_COL[0]) : 'rgba(160,195,230,0.4)';
     ctx.fillText(glyph, bx + bw / 2, byy + 30);
     ctx.font = '700 8.5px Verdana, sans-serif';
     ctx.fillStyle = afford ? 'rgba(220,238,255,0.95)' : 'rgba(160,195,230,0.45)';
@@ -1369,8 +1573,8 @@ function drawShop() {
     const afford = me.cash >= w.cost;
     const hov = mouse.x > bx && mouse.x < bx + 160 && mouse.y > byy && mouse.y < byy + 112;
     card(bx, byy, 160, 112, w.glyph, w.name, w.cost,
-      w.builds ? 'BUILDS ' + w.r + 'PX' : w.rolls ? 'ROLLS · ' + w.dmg + ' DMG' : w.splits ? '5 WARHEADS' : w.flows ? 'FLOWS · BURNS' : w.r + 'PX · ' + w.dmg + ' DMG',
-      'HAVE ' + (me.ammo[wk] || 0), afford, hov);
+      w.builds ? 'BUILDS ' + w.r + 'PX' : w.rolls ? 'ROLLS · ' + w.dmg + ' DMG' : w.splits ? w.splits + ' WARHEADS' : w.flows ? 'FLOWS · BURNS' : w.r + 'PX · ' + w.dmg + ' DMG',
+      'HAVE ' + (me.ammo[wk] || 0), afford, hov, WEAPON_TINT[wk]);
   });
   Object.keys(GEAR).forEach((gk, i) => {
     const g = GEAR[gk];
@@ -1443,30 +1647,61 @@ function drawTitle() {
   ctx.fillRect(0, 0, W, H);
   // a battle plays out dimly behind the title — world only, no chrome
   ctx.save();
-  ctx.globalAlpha = 0.65;
+  ctx.globalAlpha = 0.9;
   const keep = G.showTitle; G.showTitle = false;
   G.hideChrome = true;
   draw();
   G.hideChrome = false;
   G.showTitle = keep;
   ctx.restore();
-  ctx.fillStyle = 'rgba(5,6,12,0.6)';
+  ctx.fillStyle = 'rgba(5,6,12,0.3)';
   ctx.fillRect(0, 0, W, H);
   const by = 108, bh = 310;
-  ctx.fillStyle = 'rgba(5,8,15,0.9)';
+  const bandG = ctx.createLinearGradient(0, by, 0, by + bh);
+  bandG.addColorStop(0, 'rgba(8,10,20,0.92)'); bandG.addColorStop(0.5, 'rgba(5,8,15,0.86)'); bandG.addColorStop(1, 'rgba(8,10,20,0.92)');
+  ctx.fillStyle = bandG;
   ctx.fillRect(0, by, W, bh);
   ctx.save();
   ctx.shadowColor = '#ff8c42'; ctx.shadowBlur = 9;
-  ctx.fillStyle = 'rgba(255,140,66,0.6)';
+  ctx.fillStyle = 'rgba(255,140,66,0.75)';
   ctx.fillRect(0, by, W, 1.5);
+  ctx.shadowColor = '#33d6ff';
+  ctx.fillStyle = 'rgba(51,214,255,0.6)';
   ctx.fillRect(0, by + bh - 1.5, W, 1.5);
+  ctx.restore();
+  // decorative shell arcs behind the wordmark: the game in one glyph
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.setLineDash([4, 7]);
+  ctx.lineWidth = 1.6;
+  for (const [x0, c0, dir] of [[150, '#33d6ff', 1], [W - 150, '#ff2e6d', -1]]) {
+    ctx.strokeStyle = hexA(c0, 0.4);
+    ctx.beginPath();
+    for (let i = 0; i <= 40; i++) {
+      const k = i / 40;
+      const ax = x0 + dir * k * 380;
+      const ay = by + bh - 20 - Math.sin(k * Math.PI) * 200;
+      if (i === 0) ctx.moveTo(ax, ay); else ctx.lineTo(ax, ay);
+    }
+    ctx.stroke();
+    // the shell riding the arc, breathing along it
+    const kk = ((G.time * 0.22 + (dir > 0 ? 0 : 0.5)) % 1);
+    const sx2 = x0 + dir * kk * 380, sy2 = by + bh - 20 - Math.sin(kk * Math.PI) * 200;
+    const sg = ctx.createRadialGradient(sx2, sy2, 0, sx2, sy2, 12);
+    sg.addColorStop(0, hexA(c0, 0.9)); sg.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = sg;
+    ctx.beginPath(); ctx.arc(sx2, sy2, 12, 0, 7); ctx.fill();
+  }
+  ctx.setLineDash([]);
   ctx.restore();
   ctx.textAlign = 'center';
   const ly = 240;
   ctx.font = '900 84px "Arial Black", Arial, sans-serif';
   ctx.letterSpacing = '8px';
   ctx.save();
-  ctx.shadowColor = '#ff8c42'; ctx.shadowBlur = 18;
+  ctx.shadowColor = '#ff8c42'; ctx.shadowBlur = 26;
+  ctx.fillStyle = '#ffb075'; ctx.fillText('NEON SCORCH', W / 2, ly);
+  ctx.shadowColor = '#ff8c42'; ctx.shadowBlur = 12;
   ctx.fillStyle = '#ffb075'; ctx.fillText('NEON SCORCH', W / 2, ly);
   ctx.shadowBlur = 4;
   ctx.fillStyle = '#ffffff'; ctx.fillText('NEON SCORCH', W / 2, ly);
